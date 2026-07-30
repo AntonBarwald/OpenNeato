@@ -243,6 +243,8 @@ function createSession(id) {
         state: {},
         faults: {},
         historySessions: new Map(),
+        historyZones: new Map(),
+        pinnedSessions: new Set(),
         rand: randomInt,
         sleep,
         getVersion: () => DEMO_VERSION,
@@ -303,6 +305,8 @@ function initScenario(session, rawScenario) {
     session.context.state = scenarioState.state;
     session.context.faults = scenarioState.faults;
     session.context.historySessions = createDefaultHistory();
+    session.context.historyZones = new Map();
+    session.context.pinnedSessions = new Set();
     session.bootTime = Date.now();
     session.initializedScenario = scenario;
     resetRecordingSimulation(session);

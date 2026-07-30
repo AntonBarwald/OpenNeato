@@ -3,12 +3,17 @@
 import clockSvg from "../../assets/icons/clock.svg?raw";
 import houseSvg from "../../assets/icons/house.svg?raw";
 import manualSvg from "../../assets/icons/manual.svg?raw";
+import sparkleSvg from "../../assets/icons/sparkle.svg?raw";
 import spotSvg from "../../assets/icons/spot.svg?raw";
 import type { MapBounds, MapData, MapPathPoint, MapTransform } from "../../types";
+import { polylineCrossesSegment, type Point } from "./geometry";
 
 const DEFAULT_TRANSFORM: MapTransform = { panX: 0, panY: 0, zoom: 1 };
 const MAP_PAD = 20;
 const GRID_STEP = 0.5;
+// Draggable handle radii, divided by zoom before drawing so they stay a constant on-screen size.
+const HANDLE_DRAW_RADIUS_PX = 6;
+const HANDLE_MIDPOINT_DRAW_RADIUS_PX = 4;
 
 export interface MapProjection {
     minX: number;
@@ -16,6 +21,9 @@ export interface MapProjection {
     minY: number;
     maxY: number;
     scale: number;
+    // Exposed so geometry.ts's inverse transform shares one source of truth with toX/toY.
+    offX: number;
+    offY: number;
     toX: (wx: number) => number;
     toY: (wy: number) => number;
 }
@@ -37,6 +45,8 @@ export function computeMapProjection(displayW: number, displayH: number, bounds:
         minY,
         maxY,
         scale,
+        offX,
+        offY,
         toX: (wx) => offX + (wx - minX) * scale,
         toY: (wy) => offY + (maxY - wy) * scale,
     };
@@ -65,10 +75,16 @@ export function isDarkSurface(canvas: HTMLCanvasElement): boolean {
     return getComputedStyle(canvas).getPropertyValue("--surface").trim().startsWith("#1");
 }
 
+// Mirrors zoneLabelFor() in firmware/src/zone_label_match.h; keep in lockstep.
+export function zoneLabel(zone: { label?: string }, idx: number): string {
+    return zone.label?.trim() || `Zone ${idx + 1}`;
+}
+
 export function modeInfo(mode: string): { label: string; icon: string } {
     if (mode === "house") return { label: "House Clean", icon: houseSvg };
     if (mode === "spot") return { label: "Spot Clean", icon: spotSvg };
     if (mode === "manual") return { label: "Manual Clean", icon: manualSvg };
+    if (mode === "guided") return { label: "Guided Clean", icon: sparkleSvg };
     return { label: mode, icon: clockSvg };
 }
 
@@ -119,6 +135,26 @@ export function interpolatePose(
     };
 }
 
+// A closed-polygon zone to render (translucent fill + labeled outline).
+export interface ZoneShape {
+    points: Point[];
+    label?: string;
+}
+
+// Guided Clean editor overlay passed to renderMap; the motion player and static fallback
+// leave this at its default and pass nogoLines/draftLine directly instead.
+export interface MapEditorOverlay {
+    zones?: ZoneShape[];
+    draftZone?: Point[] | null; // In-progress zone: polygon clicks or live rectangle drag corners
+    selectedNoGoIndex?: number | null;
+    selectedZoneIndex?: number | null;
+    enforcePreview?: boolean; // Recolors path hops crossing a no-go line, previewing what replay would skip
+    // Only one of these is ever set at a time; renderMap substitutes it into the relevant
+    // line/zone for that render instead of mutating state.
+    dragNoGoPoints?: Point[] | null;
+    dragZonePoints?: Point[] | null;
+}
+
 // Canvas renderer for map visualization. When `currentTime` is provided the
 // renderer draws only the portion of the session up to that timestamp and
 // shows the interpolated robot pose as a directional sprite — used by the
@@ -131,6 +167,9 @@ export function renderMap(
     tf?: MapTransform,
     currentTime?: number,
     rotation = 0,
+    nogoLines: Point[][] = [],
+    draftLine: Point[] | null = null,
+    overlay: MapEditorOverlay = {},
 ) {
     const ctx = canvas.getContext("2d");
     if (!ctx || !map.bounds) return;
@@ -169,6 +208,19 @@ export function renderMap(
     const { scale, toX, toY } = proj;
     const isDark = isDarkSurface(canvas);
 
+    // Substitute the live drag preview into the shape being dragged so the enforcement
+    // preview, drawZones and drawNoGoLines all see the in-flight reshape, not stale points.
+    const effectiveNoGoLines =
+        overlay.dragNoGoPoints && overlay.selectedNoGoIndex != null
+            ? nogoLines.map((l, i) => (i === overlay.selectedNoGoIndex ? overlay.dragNoGoPoints! : l))
+            : nogoLines;
+    const effectiveZones =
+        overlay.dragZonePoints && overlay.selectedZoneIndex != null
+            ? (overlay.zones ?? []).map((z, i) =>
+                  i === overlay.selectedZoneIndex ? { ...z, points: overlay.dragZonePoints! } : z,
+              )
+            : (overlay.zones ?? []);
+
     // Grid lines - draw first so coverage/path render on top
     drawMapGrid(ctx, proj, isDark);
 
@@ -202,16 +254,35 @@ export function renderMap(
     }
 
     if (drawnPath.length > 1) {
-        ctx.beginPath();
-        ctx.moveTo(toX(drawnPath[0].x), toY(drawnPath[0].y));
-        for (let i = 1; i < drawnPath.length; i++) {
-            ctx.lineTo(toX(drawnPath[i].x), toY(drawnPath[i].y));
+        const pathColor = isDark ? "rgba(249, 235, 178, 0.6)" : "rgba(180, 140, 40, 0.5)";
+        if (overlay.enforcePreview && effectiveNoGoLines.length > 0) {
+            // Draw each hop individually so a hop crossing a no-go line can be greyed out.
+            const blockedColor = isDark ? "rgba(142, 142, 147, 0.65)" : "rgba(120, 120, 120, 0.55)";
+            ctx.lineJoin = "round";
+            ctx.lineCap = "round";
+            ctx.lineWidth = 2;
+            for (let i = 1; i < drawnPath.length; i++) {
+                const a = drawnPath[i - 1];
+                const b = drawnPath[i];
+                const blocked = effectiveNoGoLines.some((line) => polylineCrossesSegment(line, a, b));
+                ctx.beginPath();
+                ctx.moveTo(toX(a.x), toY(a.y));
+                ctx.lineTo(toX(b.x), toY(b.y));
+                ctx.strokeStyle = blocked ? blockedColor : pathColor;
+                ctx.stroke();
+            }
+        } else {
+            ctx.beginPath();
+            ctx.moveTo(toX(drawnPath[0].x), toY(drawnPath[0].y));
+            for (let i = 1; i < drawnPath.length; i++) {
+                ctx.lineTo(toX(drawnPath[i].x), toY(drawnPath[i].y));
+            }
+            ctx.strokeStyle = pathColor;
+            ctx.lineWidth = 2;
+            ctx.lineJoin = "round";
+            ctx.lineCap = "round";
+            ctx.stroke();
         }
-        ctx.strokeStyle = isDark ? "rgba(249, 235, 178, 0.6)" : "rgba(180, 140, 40, 0.5)";
-        ctx.lineWidth = 2;
-        ctx.lineJoin = "round";
-        ctx.lineCap = "round";
-        ctx.stroke();
     }
 
     // Start point
@@ -276,6 +347,174 @@ export function renderMap(
         ctx.lineWidth = 1.5;
         ctx.stroke();
     }
+
+    // Editor overlay drawn last so it sits above path/coverage/recharge layers.
+    drawZones(ctx, proj, effectiveZones, overlay.draftZone ?? null, overlay.selectedZoneIndex ?? null, isDark);
+    drawNoGoLines(ctx, proj, effectiveNoGoLines, draftLine, overlay.selectedNoGoIndex ?? null);
+    drawVertexHandles(
+        ctx,
+        proj,
+        zoom,
+        overlay.selectedNoGoIndex ?? null,
+        overlay.selectedZoneIndex ?? null,
+        effectiveNoGoLines,
+        effectiveZones,
+    );
+}
+
+// Dashed red polylines with vertex dots, plus the in-progress draft in dashed amber; the
+// selected line is drawn thicker in orange.
+function drawNoGoLines(
+    ctx: CanvasRenderingContext2D,
+    proj: MapProjection,
+    lines: Point[][],
+    draft: Point[] | null,
+    selectedIndex: number | null,
+) {
+    const { toX, toY } = proj;
+    const strokePolyline = (pts: Point[], color: string, dash: number[], width: number) => {
+        if (pts.length === 0) return;
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.fillStyle = color;
+        ctx.lineJoin = "round";
+        ctx.lineCap = "round";
+        if (pts.length > 1) {
+            ctx.setLineDash(dash);
+            ctx.lineWidth = width;
+            ctx.beginPath();
+            ctx.moveTo(toX(pts[0].x), toY(pts[0].y));
+            for (let i = 1; i < pts.length; i++) ctx.lineTo(toX(pts[i].x), toY(pts[i].y));
+            ctx.stroke();
+        }
+        ctx.setLineDash([]);
+        for (const p of pts) {
+            ctx.beginPath();
+            ctx.arc(toX(p.x), toY(p.y), 3, 0, Math.PI * 2);
+            ctx.fill();
+        }
+        ctx.restore();
+    };
+
+    lines.forEach((line, idx) => {
+        const selected = idx === selectedIndex;
+        strokePolyline(
+            line,
+            selected ? "rgba(255, 159, 10, 0.95)" : "rgba(255, 69, 58, 0.9)",
+            [6, 4],
+            selected ? 4 : 3,
+        );
+    });
+    if (draft) strokePolyline(draft, "rgba(255, 204, 0, 0.95)", [4, 4], 2);
+}
+
+// Translucent filled polygons with a labeled outline, plus the in-progress draft in dashed
+// amber; the selected zone gets a brighter, thicker outline.
+function drawZones(
+    ctx: CanvasRenderingContext2D,
+    proj: MapProjection,
+    zones: ZoneShape[],
+    draft: Point[] | null,
+    selectedIndex: number | null,
+    isDark: boolean,
+) {
+    const { toX, toY } = proj;
+    const fillPolygon = (pts: Point[], fill: string, stroke: string, width: number, dash: number[] = []) => {
+        if (pts.length < 2) return;
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(toX(pts[0].x), toY(pts[0].y));
+        for (let i = 1; i < pts.length; i++) ctx.lineTo(toX(pts[i].x), toY(pts[i].y));
+        ctx.closePath();
+        ctx.fillStyle = fill;
+        ctx.fill();
+        ctx.setLineDash(dash);
+        ctx.strokeStyle = stroke;
+        ctx.lineWidth = width;
+        ctx.stroke();
+        ctx.restore();
+    };
+
+    const fillColor = isDark ? "rgba(10, 132, 255, 0.15)" : "rgba(10, 98, 255, 0.12)";
+    zones.forEach((zone, idx) => {
+        const selected = idx === selectedIndex;
+        fillPolygon(
+            zone.points,
+            fillColor,
+            selected ? "rgba(10, 132, 255, 0.95)" : "rgba(10, 132, 255, 0.55)",
+            selected ? 3 : 1.5,
+        );
+        if (zone.label && zone.points.length > 0) {
+            const cx = zone.points.reduce((sum, p) => sum + p.x, 0) / zone.points.length;
+            const cy = zone.points.reduce((sum, p) => sum + p.y, 0) / zone.points.length;
+            ctx.save();
+            ctx.fillStyle = isDark ? "rgba(255, 255, 255, 0.85)" : "rgba(20, 20, 20, 0.85)";
+            ctx.font = "12px sans-serif";
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            ctx.fillText(zone.label, toX(cx), toY(cy));
+            ctx.restore();
+        }
+    });
+
+    if (draft && draft.length >= 2) {
+        fillPolygon(draft, "rgba(255, 204, 0, 0.12)", "rgba(255, 204, 0, 0.9)", 2, [4, 4]);
+    }
+}
+
+// Only the selected shape's handles are drawn — matches what pickHandleAt hit-tests.
+// Radii divided by `zoom` so they stay a constant screen-pixel size.
+function drawVertexHandles(
+    ctx: CanvasRenderingContext2D,
+    proj: MapProjection,
+    zoom: number,
+    selectedNoGoIndex: number | null,
+    selectedZoneIndex: number | null,
+    lines: Point[][],
+    zones: ZoneShape[],
+) {
+    let points: Point[] | null = null;
+    let closed = false;
+    if (selectedNoGoIndex != null) {
+        points = lines[selectedNoGoIndex] ?? null;
+    } else if (selectedZoneIndex != null) {
+        points = zones[selectedZoneIndex]?.points ?? null;
+        closed = true;
+    }
+    if (!points || points.length === 0) return;
+
+    const { toX, toY } = proj;
+    const vertexR = HANDLE_DRAW_RADIUS_PX / zoom;
+    const midpointR = HANDLE_MIDPOINT_DRAW_RADIUS_PX / zoom;
+    // Matches pickHandleAt's segCount rule: zones close the polygon, no-go lines don't.
+    const segCount = closed ? points.length : points.length - 1;
+
+    // Midpoints first so vertex handles paint on top at shared screen positions.
+    ctx.save();
+    ctx.fillStyle = "rgba(255, 255, 255, 0.45)";
+    ctx.strokeStyle = "rgba(10, 132, 255, 0.55)";
+    ctx.lineWidth = 1 / zoom;
+    for (let i = 0; i < segCount; i++) {
+        const a = points[i];
+        const b = points[(i + 1) % points.length];
+        ctx.beginPath();
+        ctx.arc(toX((a.x + b.x) / 2), toY((a.y + b.y) / 2), midpointR, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+    }
+    ctx.restore();
+
+    ctx.save();
+    ctx.fillStyle = "rgba(255, 255, 255, 0.95)";
+    ctx.strokeStyle = "rgba(10, 132, 255, 0.95)";
+    ctx.lineWidth = 1.5 / zoom;
+    for (const p of points) {
+        ctx.beginPath();
+        ctx.arc(toX(p.x), toY(p.y), vertexR, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+    }
+    ctx.restore();
 }
 
 // Draws the animated robot sprite: a filled circle with a small nose pointing

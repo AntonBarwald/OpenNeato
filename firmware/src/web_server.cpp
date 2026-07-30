@@ -9,15 +9,23 @@
 #include "notification_manager.h"
 #include "cleaning_history.h"
 #include "wifi_manager.h"
+#include "zones_manager.h"
+#include "navigation_poc.h"
+#include "navigation_manager.h"
+#include "maintenance_tracker.h"
+#include "whole_house_timer.h"
 #include <SPIFFS.h>
 
 unsigned long WebServer::lastApiActivity = 0;
 
 WebServer::WebServer(AsyncWebServer& server, NeatoSerial& neato, DataLogger& logger, SystemManager& sys,
                      FirmwareManager& fw, SettingsManager& settings, ManualCleanManager& manual,
-                     NotificationManager& notif, CleaningHistory& history, WiFiManager& wifi) :
+                     NotificationManager& notif, CleaningHistory& history, WiFiManager& wifi, ZonesManager& zones,
+                     NavigationPoc& navPoc, NavigationManager& navMgr, MaintenanceTracker& maint,
+                     WholeHouseTimer& wholeHouseTimer) :
     server(server), neato(neato), logger(logger), sysMgr(sys), fwMgr(fw), settingsMgr(settings), manualMgr(manual),
-    notifMgr(notif), historyMgr(history), wifiMgr(wifi) {}
+    notifMgr(notif), historyMgr(history), wifiMgr(wifi), zonesMgr(zones), navPoc(navPoc), navMgr(navMgr),
+    maintMgr(maint), wholeHouseTimer(wholeHouseTimer) {}
 
 void WebServer::loggedRoute(const char *path, WebRequestMethodComposite httpMethod, SyncHandler handler) {
     server.on(path, httpMethod, [this, handler](AsyncWebServerRequest *request) {
@@ -28,14 +36,50 @@ void WebServer::loggedRoute(const char *path, WebRequestMethodComposite httpMeth
     });
 }
 
+void WebServer::runBodyHandler(AsyncWebServerRequest *request, const BodyHandler& handler, uint8_t *data, size_t len) {
+    lastApiActivity = millis();
+    unsigned long startMs = lastApiActivity;
+    int status = handler(request, data, len);
+    logger.logRequest(request->method(), request->url().c_str(), status, millis() - startMs);
+}
+
 void WebServer::loggedBodyRoute(const char *path, WebRequestMethodComposite httpMethod, BodyHandler handler) {
     server.on(
             path, httpMethod, [](AsyncWebServerRequest *request) { /* handled in body callback */ }, nullptr,
-            [this, handler](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t, size_t) {
-                lastApiActivity = millis();
-                unsigned long startMs = lastApiActivity;
-                int status = handler(request, data, len);
-                logger.logRequest(request->method(), request->url().c_str(), status, millis() - startMs);
+            [this, handler](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+                // Body callback fires once per TCP segment; accumulate across fragments and
+                // invoke the handler once, on the last fragment.
+
+                // Fast path: whole body arrived in one segment — no buffering.
+                if (index == 0 && len == total) {
+                    runBodyHandler(request, handler, data, len);
+                    return;
+                }
+
+                // Bound memory before allocating. Per-route handlers still apply
+                // their own (smaller) caps once the body is assembled.
+                if (total > WEB_BODY_MAX_BYTES) {
+                    if (index == 0)
+                        sendError(request, 413, "request body too large");
+                    return;
+                }
+
+                // malloc (not new) so the library's free(_tempObject) cleanup can't mis-free it.
+                if (index == 0)
+                    request->_tempObject = malloc(total);
+                uint8_t *buf = static_cast<uint8_t *>(request->_tempObject);
+                if (buf == nullptr) {
+                    if (index + len >= total)
+                        sendError(request, 500, "out of memory");
+                    return;
+                }
+                memcpy(buf + index, data, len);
+                if (index + len < total)
+                    return; // wait for the remaining segments
+
+                runBodyHandler(request, handler, buf, total);
+                free(buf);
+                request->_tempObject = nullptr;
             });
 }
 
@@ -73,6 +117,8 @@ void WebServer::begin() {
     registerFirmwareRoutes();
     registerMapRoutes();
     registerWiFiRoutes();
+    registerNavigationRoutes();
+    registerMaintenanceRoutes();
 
     LOG("WEB", "Frontend and API routes registered");
 }
@@ -97,13 +143,58 @@ void WebServer::registerApiRoutes() {
     // All parameterized actions use query strings: resource URL identifies the
     // command, query params carry arguments (mirrors Neato serial protocol).
 
-    registerPostRoute("/api/clean", neato, &NeatoSerial::clean, {"action"});
+    registerPostRoute("/api/clean", neato, &NeatoSerial::clean, {"action", "width", "height"});
     registerPostRoute("/api/sound", neato, &NeatoSerial::playSound, {"id"});
     registerPostRoute("/api/power", neato, &NeatoSerial::powerControl, {"action"});
     registerPostRoute("/api/lidar/rotate", neato, &NeatoSerial::setLdsRotation, {"enable"});
     registerPostRoute("/api/user-settings", neato, &NeatoSerial::setUserSetting, {"key", "value"});
     registerPostRoute("/api/clear-errors", neato, &NeatoSerial::clearErrors, {});
     registerPostRoute("/api/battery/new", neato, &NeatoSerial::newBattery, {});
+
+    // Whole-house early-return timer -- local state only, no serial I/O, so hand-written
+    // rather than registerPostRoute/registerGetRoute (both built around NeatoSerial callbacks).
+    // POST /api/clean-timer?action=arm&minutes=<n> -- arms the timer for n minutes.
+    // POST /api/clean-timer?action=cancel -- disarms it (the dashboard calls this before
+    // dispatching any other clean action, so a stale timer never outlives the run it was set for).
+    loggedRoute("/api/clean-timer", HTTP_POST, [this](AsyncWebServerRequest *request) -> int {
+        if (!request->hasParam("action")) {
+            sendError(request, 400, "missing action");
+            return 400;
+        }
+        String action = request->getParam("action")->value();
+        if (action == "cancel") {
+            wholeHouseTimer.cancel();
+            sendOk(request);
+            return 200;
+        }
+        if (action == "arm") {
+            if (!request->hasParam("minutes")) {
+                sendError(request, 400, "missing minutes");
+                return 400;
+            }
+            int minutes = request->getParam("minutes")->value().toInt();
+            // Upper bound matters, not just lower: durationMinutes * 60000UL overflows the 32-bit
+            // unsigned long deadline math above ~71583 minutes (see clean_timer_policy.h), so an
+            // unbounded large value can silently wrap into a deadline seconds away, not days away.
+            if (minutes <= 0 || minutes > CLEAN_TIMER_MAX_MINUTES) {
+                sendError(request, 400, "minutes must be between 1 and " + String(CLEAN_TIMER_MAX_MINUTES));
+                return 400;
+            }
+            wholeHouseTimer.arm(static_cast<unsigned long>(minutes));
+            sendOk(request);
+            return 200;
+        }
+        sendError(request, 400, "invalid action");
+        return 400;
+    });
+
+    // GET /api/clean-timer -- whole-house early-return timer status (no serial I/O)
+    loggedRoute("/api/clean-timer", HTTP_GET, [this](AsyncWebServerRequest *request) -> int {
+        request->send(200, "application/json",
+                      fieldsToJson({{"armed", wholeHouseTimer.isArmed() ? "true" : "false", FIELD_BOOL},
+                                    {"remainingSec", String(wholeHouseTimer.remainingSec()), FIELD_INT}}));
+        return 200;
+    });
 
     // Serial endpoint — send arbitrary serial command, returns raw response.
     // Always available (no debug gate — useful for diagnostics without enabling verbose logging).
@@ -166,6 +257,11 @@ static String downloadName(const String& filename) {
     if (filename.endsWith(".hs"))
         return filename.substring(0, filename.length() - 3);
     return filename;
+}
+
+// Validates /zones and /pin sub-routes so they 404 on a made-up session name.
+static bool sessionFileExists(const String& name) {
+    return SPIFFS.exists(String(HISTORY_DIR) + "/" + name);
 }
 
 static String logListJson(const std::vector<LogFileInfo>& files) {
@@ -403,6 +499,7 @@ void WebServer::registerFirmwareRoutes() {
 void WebServer::registerMapRoutes() {
 
     // GET /api/history[/filename] — list sessions, collection status, or download a specific file
+    // Also handles GET /api/history/<name>/zones (fetch stored no-go/zone geometry).
     server.on("/api/history", HTTP_GET, [this](AsyncWebServerRequest *request) {
         lastApiActivity = millis();
         unsigned long startMs = lastApiActivity;
@@ -418,7 +515,8 @@ void WebServer::registerMapRoutes() {
                 const auto& s = sessions[i];
                 json += R"({"name":")" + s.name + R"(","size":)" + String(static_cast<unsigned long>(s.size)) +
                         R"(,"compressed":)" + String(s.compressed ? "true" : "false") + R"(,"recording":)" +
-                        String(s.recording ? "true" : "false");
+                        String(s.recording ? "true" : "false") + R"(,"pinned":)" +
+                        String(zonesMgr.isPinned(s.name) ? "true" : "false");
                 if (s.session.length() > 0) {
                     json += ",\"session\":" + s.session;
                 } else {
@@ -434,6 +532,19 @@ void WebServer::registerMapRoutes() {
             json += "]";
             logger.logRequest(HTTP_GET, "/api/history", 200, millis() - startMs);
             request->send(200, "application/json", json);
+            return;
+        }
+
+        // GET /api/history/<name>/zones — fetch stored no-go/zone geometry (verbatim JSON)
+        if (suffix.endsWith("/zones")) {
+            String name = suffix.substring(0, suffix.length() - String("/zones").length());
+            if (!zonesMgr.hasZones(name)) {
+                logger.logRequest(HTTP_GET, request->url().c_str(), 404, millis() - startMs);
+                sendError(request, 404, "no zones for session");
+                return;
+            }
+            logger.logRequest(HTTP_GET, request->url().c_str(), 200, millis() - startMs);
+            request->send(200, "application/json", zonesMgr.getZones(name));
             return;
         }
 
@@ -456,17 +567,73 @@ void WebServer::registerMapRoutes() {
         request->send(response);
     });
 
-    // DELETE /api/history[/filename] — delete one or all sessions
-    loggedRoute("/api/history", HTTP_DELETE, [this](AsyncWebServerRequest *request) -> int {
-        String filename = request->url().substring(String("/api/history/").length());
+    // PUT /api/history/<name>/zones — store no-go/zone geometry (verbatim JSON, size-capped)
+    loggedBodyRoute("/api/history", HTTP_PUT, [this](AsyncWebServerRequest *request, uint8_t *data, size_t len) -> int {
+        String suffix = request->url().substring(String("/api/history/").length());
+        if (!suffix.endsWith("/zones")) {
+            sendError(request, 404, "not found");
+            return 404;
+        }
+        String name = suffix.substring(0, suffix.length() - String("/zones").length());
+        if (!sessionFileExists(name)) {
+            sendError(request, 404, "session not found");
+            return 404;
+        }
+        // Fail fast on oversized declared bodies (defense-in-depth; setZones also
+        // caps). Multi-segment bodies are assembled by loggedBodyRoute first.
+        if (request->contentLength() > ZONES_MAX_BYTES) {
+            sendError(request, 413, "zones payload too large");
+            return 413;
+        }
+        String body = String(reinterpret_cast<const char *>(data), len);
+        String error;
+        if (!zonesMgr.setZones(name, body, error)) {
+            sendError(request, 400, error);
+            return 400;
+        }
+        // Echo the persisted blob, not {ok:true} — saveZones() stores the response as the
+        // new draft; {ok:true} made zonesDraft.noGoLines undefined and crashed the map view.
+        request->send(200, "application/json", body);
+        return 200;
+    });
 
-        if (filename.isEmpty()) {
+    // DELETE /api/history[/filename] — delete one or all sessions.
+    // Also handles DELETE /api/history/<name>/zones and /api/history/<name>/pin.
+    loggedRoute("/api/history", HTTP_DELETE, [this](AsyncWebServerRequest *request) -> int {
+        String suffix = request->url().substring(String("/api/history/").length());
+
+        if (suffix.isEmpty()) {
             historyMgr.deleteAllSessions();
+            zonesMgr.deleteAll();
             sendOk(request);
             return 200;
         }
 
-        if (historyMgr.deleteSession(filename)) {
+        if (suffix.endsWith("/zones")) {
+            String name = suffix.substring(0, suffix.length() - String("/zones").length());
+            if (!zonesMgr.deleteZones(name)) {
+                sendError(request, 404, "no zones for session");
+                return 404;
+            }
+            sendOk(request);
+            return 200;
+        }
+
+        if (suffix.endsWith("/pin")) {
+            String name = suffix.substring(0, suffix.length() - String("/pin").length());
+            if (!sessionFileExists(name)) {
+                sendError(request, 404, "session not found");
+                return 404;
+            }
+            zonesMgr.unpin(name);
+            sendOk(request);
+            return 200;
+        }
+
+        if (historyMgr.deleteSession(suffix)) {
+            // Clean up any zones/pin state so it doesn't linger as orphaned storage.
+            zonesMgr.deleteZones(suffix);
+            zonesMgr.unpin(suffix);
             sendOk(request);
             return 200;
         }
@@ -510,6 +677,25 @@ void WebServer::registerMapRoutes() {
                 }
             });
 
+    // POST /api/history/<name>/pin — mark a session as pinned (protected from cleanup eviction).
+    // Registered after /api/history/import so that more specific route keeps matching first
+    // (ESPAsyncWebServer matches by prefix in registration order — see registerManualRoutes).
+    loggedRoute("/api/history", HTTP_POST, [this](AsyncWebServerRequest *request) -> int {
+        String suffix = request->url().substring(String("/api/history/").length());
+        if (!suffix.endsWith("/pin")) {
+            sendError(request, 404, "not found");
+            return 404;
+        }
+        String name = suffix.substring(0, suffix.length() - String("/pin").length());
+        if (!sessionFileExists(name)) {
+            sendError(request, 404, "session not found");
+            return 404;
+        }
+        zonesMgr.pin(name);
+        sendOk(request);
+        return 200;
+    });
+
     LOG("WEB", "History routes registered");
 }
 
@@ -531,4 +717,106 @@ void WebServer::registerWiFiRoutes() {
     registerPostRoute("/api/wifi/disconnect", wifiMgr, &WiFiManager::disconnect, {});
 
     LOG("WEB", "WiFi routes registered");
+}
+
+// -- Navigation endpoints (#70 POC, #71 Guided Clean) -------------------------
+
+void WebServer::registerNavigationRoutes() {
+    // Register longer paths first — ESPAsyncWebServer matches by prefix (see registerManualRoutes).
+
+    // GET /api/navigate/status — #70 POC state (no serial I/O)
+    loggedRoute("/api/navigate/status", HTTP_GET, [this](AsyncWebServerRequest *request) -> int {
+        request->send(200, "application/json", navPoc.getStatusJson());
+        return 200;
+    });
+
+    // POST /api/navigate/stop — abort the #70 POC drive, idempotent
+    loggedRoute("/api/navigate/stop", HTTP_POST, [this](AsyncWebServerRequest *request) -> int {
+        navPoc.stop();
+        sendOk(request);
+        return 200;
+    });
+
+    // POST /api/navigate — start the #70 POC drive. Body: JSON point array
+    // (point_array_json.h format), e.g. [{"x":1.2,"y":3.4},{"x":2,"y":2}].
+    loggedBodyRoute("/api/navigate", HTTP_POST,
+                    [this](AsyncWebServerRequest *request, uint8_t *data, size_t len) -> int {
+                        String body = String(reinterpret_cast<const char *>(data), len);
+                        String error;
+                        if (!navPoc.start(body, error)) {
+                            sendError(request, 409, error);
+                            return 409;
+                        }
+                        sendOk(request);
+                        return 200;
+                    });
+
+    // GET /api/guided/status — #71 Guided Clean state machine status (no serial I/O).
+    // Kept live even though start is retired below: NavigationManager itself isn't deleted
+    // (dormant, not gone), so a way to observe it stays available.
+    loggedRoute("/api/guided/status", HTTP_GET, [this](AsyncWebServerRequest *request) -> int {
+        request->send(200, "application/json", navMgr.getStatusJson());
+        return 200;
+    });
+
+    // POST /api/guided?action=stop — abort immediately, idempotent. Deliberately kept working
+    // even though start is retired: removing a stop path is the opposite of safety, and this
+    // is a no-cost brake to keep in case anything (a future re-enable, a residual code path)
+    // ever gets navMgr into a running state again.
+    // POST /api/guided?action=start — retired. Guided Clean's navigation is unvalidated
+    // (unproven infeasible; uncalibrated cliff-sensor backstop) and must not be startable from
+    // any surface. Refuses explicitly (409) rather than a silent no-op, so a caller — this was
+    // reachable before retirement via a pinned session name — knows the request was rejected,
+    // not just dropped.
+    loggedRoute("/api/guided", HTTP_POST, [this](AsyncWebServerRequest *request) -> int {
+        if (!request->hasParam("action")) {
+            sendError(request, 400, "missing action");
+            return 400;
+        }
+        String action = request->getParam("action")->value();
+
+        if (action == "stop") {
+            navMgr.stop();
+            sendOk(request);
+            return 200;
+        }
+
+        if (action == "start") {
+            sendError(request, 409, "Guided Clean is retired and cannot be started");
+            return 409;
+        }
+
+        sendError(request, 400, "invalid action");
+        return 400;
+    });
+
+    LOG("WEB", "Navigation routes registered");
+}
+
+// -- Maintenance/consumable tracking endpoints --------------------------------
+
+void WebServer::registerMaintenanceRoutes() {
+    // Synchronous, local (no serial I/O), so loggedRoute directly rather than
+    // registerGetRoute/registerPostRoute (built around async serial callbacks).
+
+    // GET /api/maintenance — hours-used and replacement interval per consumable
+    loggedRoute("/api/maintenance", HTTP_GET, [this](AsyncWebServerRequest *request) -> int {
+        request->send(200, "application/json", maintMgr.get().toJson());
+        return 200;
+    });
+
+    // POST /api/maintenance/reset?item=brush|filter|sideBrush|sensors
+    loggedRoute("/api/maintenance/reset", HTTP_POST, [this](AsyncWebServerRequest *request) -> int {
+        String itemName = request->hasParam("item") ? request->getParam("item")->value() : "";
+        MaintenanceItem item = parseMaintenanceItem(itemName);
+        if (item == MAINT_ITEM_INVALID) {
+            sendError(request, 400, "invalid item");
+            return 400;
+        }
+        maintMgr.reset(item);
+        sendOk(request);
+        return 200;
+    });
+
+    LOG("WEB", "Maintenance routes registered");
 }

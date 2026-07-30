@@ -3,11 +3,13 @@ import type {
     BatteryAnalogData,
     BatteryWarrantyData,
     ChargerData,
+    CleanTimerStatus,
     ErrorData,
     FirmwareVersion,
     HistoryFileInfo,
     LidarScan,
     LogFileInfo,
+    MaintenanceData,
     ManualStatus,
     MapData,
     SettingsData,
@@ -17,6 +19,7 @@ import type {
     VersionData,
     WiFiScanResult,
     WiFiStatus,
+    ZonesBlob,
 } from "./types";
 
 async function parseError(res: Response): Promise<string> {
@@ -128,10 +131,15 @@ export const api = {
     getSystem: () => get<SystemData>("/api/system"),
     getFirmwareVersion: () => get<FirmwareVersion>("/api/firmware/version"),
     cleanHouse: () => post("/api/clean?action=house"),
-    cleanSpot: () => post("/api/clean?action=spot"),
+    cleanSpot: (widthCm = 0, heightCm = 0) => post(`/api/clean?action=spot&width=${widthCm}&height=${heightCm}`),
     cleanPause: () => post("/api/clean?action=pause"),
     cleanStop: () => post("/api/clean?action=stop"),
     cleanDock: () => post("/api/clean?action=dock"),
+    // Whole-house early-return timer — separate from /api/clean; the dashboard must cancel
+    // it before any action that isn't "continue this same timed run" (see web_server.cpp).
+    getCleanTimerStatus: () => get<CleanTimerStatus>("/api/clean-timer"),
+    armCleanTimer: (minutes: number) => post(`/api/clean-timer?action=arm&minutes=${minutes}`),
+    cancelCleanTimer: () => post("/api/clean-timer?action=cancel"),
     manual: (enable: boolean) => post(`/api/manual?enable=${enable ? 1 : 0}`),
     manualMove: (left: number, right: number, speed: number) =>
         post(`/api/manual/move?left=${left}&right=${right}&speed=${speed}`),
@@ -159,6 +167,23 @@ export const api = {
     getHistorySession: (filename: string) => fetchSessionData(filename),
     deleteHistorySession: (name: string) => del(`/api/history/${name}`),
     deleteAllHistory: () => del("/api/history"),
+    getZones: async (filename: string): Promise<ZonesBlob> => {
+        // A session that has never had zones saved returns 404 ("no zones for
+        // session"); treat that as an empty blob so the editor still opens,
+        // rather than surfacing it as a fatal load error.
+        const res = await fetch(`/api/history/${filename}/zones`);
+        if (res.status === 404) return { zones: [], noGoLines: [] };
+        if (!res.ok) throw new Error(await parseError(res));
+        try {
+            return (await res.json()) as ZonesBlob;
+        } catch {
+            throw new ResponseParseError(`/api/history/${filename}/zones`);
+        }
+    },
+    saveZones: (filename: string, body: ZonesBlob) => put<ZonesBlob>(`/api/history/${filename}/zones`, body),
+    deleteZones: (filename: string) => del(`/api/history/${filename}/zones`),
+    pinSession: (filename: string) => post(`/api/history/${filename}/pin`),
+    unpinSession: (filename: string) => del(`/api/history/${filename}/pin`),
     importSession: (file: File, onProgress: (pct: number) => void) => importSession(file, onProgress),
     uploadFirmware: (file: File, md5: string, onProgress: (pct: number) => void) =>
         uploadFirmware(file, md5, onProgress),
@@ -167,6 +192,9 @@ export const api = {
     getUserSettings: () => get<UserSettingsData>("/api/user-settings"),
     setUserSetting: (key: string, value: string) =>
         post(`/api/user-settings?key=${encodeURIComponent(key)}&value=${encodeURIComponent(value)}`),
+
+    getMaintenance: () => get<MaintenanceData>("/api/maintenance"),
+    resetMaintenanceItem: (item: string) => post(`/api/maintenance/reset?item=${encodeURIComponent(item)}`),
 
     getWifiStatus: () => get<WiFiStatus>("/api/wifi/status"),
     scanWifi: () => get<WiFiScanResult>("/api/wifi/scan"),

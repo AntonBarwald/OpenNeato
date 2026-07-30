@@ -51,6 +51,10 @@ public:
     void getVersion(std::function<void(bool, const VersionData&)> callback);
     void getCharger(std::function<void(bool, const ChargerData&)> callback);
     void getBatteryAnalog(std::function<void(bool, const BatteryAnalogData&)> callback);
+    // Forces a fresh, uncached, PRIORITY_HIGH read — used by ManualCleanManager's
+    // drop-sensor safety poll. Distinct name (not an overload of getBatteryAnalog)
+    // so the by-pointer route registration for getBatteryAnalog stays unambiguous.
+    void getBatteryAnalogHighPriority(std::function<void(bool, const BatteryAnalogData&)> callback);
     void getBatteryWarranty(std::function<void(bool, const BatteryWarrantyData&)> callback);
     void getUserSettings(std::function<void(bool, const UserSettingsData&)> callback);
     void getDigitalSensors(std::function<void(bool, const DigitalSensorData&)> callback);
@@ -64,7 +68,8 @@ public:
     void getRobotPos(bool smooth, std::function<void(bool, const RobotPosData&)> callback);
     // -- Action commands (fire-and-forget by default) ------------------------
 
-    bool clean(const String& action, std::function<void(bool)> callback = nullptr);
+    // widthCm/heightCm only apply to action=="spot"; 0 or -1 means robot default (unclamped elsewhere).
+    bool clean(const String& action, int widthCm, int heightCm, std::function<void(bool)> callback = nullptr);
     bool testMode(bool enable, std::function<void(bool)> callback = nullptr);
     bool playSound(SoundId soundId, std::function<void(bool)> callback = nullptr);
     bool setLdsRotation(bool on, std::function<void(bool)> callback = nullptr);
@@ -119,6 +124,12 @@ public:
     // Used by CleaningHistory to switch to active polling immediately.
     void onCleanStart(std::function<void()> cb) { cleanStartCallback = cb; }
 
+    // Bumped every time clean() starts a new session (house/spot) from idle, regardless of
+    // caller (web route, scheduler, ...). Lets a timer/token record which clean it belongs to
+    // (see WholeHouseTimer) instead of just a deadline, so it can tell "my clean is still
+    // running" apart from "a different clean has since started."
+    unsigned long currentCleanGeneration() const { return cleanGeneration; }
+
     // -- Navigation mode getter ----------------------------------------------
     // Called from clean() before house clean to send SetNavigationMode.
     // Returns the stored nav mode string (e.g. "Normal", "Gentle").
@@ -132,10 +143,24 @@ public:
 private:
     void tick() override; // Called every loop() iteration (intervalMs = 0 — UART state machine)
 
+    // Sized-spot-clean safety net: fires once, SPOT_VERIFY_DELAY_MS after a spot start,
+    // and checks GetState for the house-clean-instead mismatch. See spot_verify.h.
+    void checkSpotVerification();
+
     HardwareSerial& uart = Serial1;
     std::vector<CommandEntry> queue;
     QueueState state = QUEUE_IDLE;
     bool manualCleanActive = false;
+
+    // Spot-start verification (armed in clean()'s "spot" branch, checked in tick())
+    bool spotVerifyPending = false;
+    unsigned long spotVerifyArmedAt = 0; // millis() when the current wait window started
+    unsigned long spotVerifyDelayMs = 0; // length of that window (initial delay or retry delay)
+    int spotVerifyAttempts = 0; // bounded retries if GetState itself fails -- see checkSpotVerification()
+    bool spotStartMismatch = false; // Latches until the next clean start or clearErrors()
+
+    // Bumped on every new clean started from idle (house/spot) -- see currentCleanGeneration().
+    unsigned long cleanGeneration = 0;
 
     // SetEvent security key (computed from robot serial number at boot)
     String sKey;
@@ -217,7 +242,7 @@ private:
     void fetchErr(std::function<void(bool, const ErrorData&)> callback);
     void fetchErrClear(std::function<void(bool, const ErrorData&)> callback);
     void fetchLdsScan(std::function<void(bool, const LdsScanData&)> callback);
-    void fetchRobotPos(const char *cmd, std::function<void(bool, const RobotPosData&)> callback);
+    void fetchRobotPos(const char *cmd, bool smooth, std::function<void(bool, const RobotPosData&)> callback);
     void fetchUserSettings(std::function<void(bool, const UserSettingsData&)> callback);
 };
 

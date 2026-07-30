@@ -2,6 +2,7 @@
 #define CLEANING_HISTORY_H
 
 #include <Arduino.h>
+#include <functional>
 #include <map>
 #include <memory>
 #include <set>
@@ -40,6 +41,9 @@ public:
     // -- File management (for API, mirrors DataLogger pattern) ----------------
 
     std::vector<HistorySessionInfo> listSessions();
+
+    // Label the recorded session "guided" while a guided run drives via manual mode
+    void setGuidedActive(bool active) { guidedActive = active; }
     std::shared_ptr<LogReader> readSession(const String& filename);
     bool deleteSession(const String& filename);
     void deleteAllSessions();
@@ -62,6 +66,11 @@ public:
     bool isImporting() const { return importing; }
     const String& getImportError() const { return importError; }
 
+    // Optional hook: true if the session is pinned, protecting it from enforceLimits()
+    // eviction. Callback (not a direct dependency) so CleaningHistory doesn't need to know
+    // about zones_manager.h.
+    void setPinnedCheck(std::function<bool(const String&)> check) { pinnedCheck = check; }
+
 private:
     void tick() override;
 
@@ -72,6 +81,7 @@ private:
     // -- State tracking ------------------------------------------------------
     String prevUiState;
     bool collecting = false;
+    bool guidedActive = false;
     bool recharging = false;
     bool fetchPending = false;
     bool recoveryAttempted = false; // Only try orphan recovery once after boot
@@ -137,6 +147,7 @@ private:
 
     // Storage enforcement — delete oldest sessions when budget exceeded
     void enforceLimits();
+    std::function<bool(const String&)> pinnedCheck;
 
     // -- Import state (separate from recording compression) -------------------
     bool importing = false;

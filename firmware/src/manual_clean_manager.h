@@ -4,8 +4,10 @@
 #include <Arduino.h>
 #include <functional>
 #include "config.h"
+#include "drop_safety.h"
 #include "json_fields.h"
 #include "loop_task.h"
+#include "motion_safety.h"
 #include "neato_serial.h"
 
 // Manages the manual clean lifecycle: TestMode entry/exit, LDS rotation,
@@ -18,11 +20,24 @@
 //   disable() → stop wheels → motors off → SetLDSRotation Off → TestMode Off
 //
 // Safety:
-//   - Bumper contact blocks forward movement
-//   - Wheel lift blocks all movement and motors
+//   - Motion is classified once per move() call into a MotionKind (Forward/Backward/
+//     RotateLeft/RotateRight) and every rule below is re-derived from that — see
+//     motion_safety.h for the decision table this replaced the old overlapping
+//     movingForward/movingBackward booleans with (they were both true for every
+//     rotation, which both over-blocked rotation on any latch and made the
+//     direction-aware bumper/drop guards dead code for every rotate).
+//   - Bumper contact blocks forward movement; for rotation, blocks only the
+//     direction that sweeps the touched corner/side further in
+//   - Wheel lift blocks all movement and motors, no exception
 //   - Stall detection: polls wheel load while moving; if load exceeds
 //     MANUAL_STALL_LOAD_PCT for MANUAL_STALL_COUNT consecutive polls, stops
-//     wheels and sets stall flags blocking further movement in that direction
+//     wheels and latches a stall flag blocking further movement in that
+//     direction — but never blocks rotation (a torque event has no reliable
+//     spatial meaning for a rotate)
+//   - Drop/cliff detection: polls DropSensorLeft/Right; over MANUAL_DROP_THRESHOLD_MM
+//     latches a sticky block on forward movement (direction-aware for rotation,
+//     like bumpers) — cleared by reversing, or auto-clears after
+//     MANUAL_DROP_CLEAR_COUNT consecutive clean polls (symmetric debounce)
 //   - Client watchdog stops wheels if no API activity within timeout
 //     (uses WebServer::lastApiActivity — any request keeps it alive)
 //
@@ -43,7 +58,18 @@ public:
     // Send a wheel move command. Validates against current obstacle state.
     // Returns false immediately if not active or a move is already queued (caller gets 503).
     // left/right: distance in mm (positive = forward, negative = backward); speed: mm/s.
+    // On rejection, lastBlockReason() carries the specific cause.
     bool move(int leftMM, int rightMM, int speedMMs, std::function<void(bool)> callback);
+
+    // Same as move(), but skips wheel-load stall detection for this one move (bumper/wheel-lift/
+    // drop safety stay fully active). For a bounded, one-shot move whose normal breakaway effort
+    // trips the stall threshold — e.g. NavigationManager::beginUndock() — not for general driving.
+    bool moveRelaxedStall(int leftMM, int rightMM, int speedMMs, std::function<void(bool)> callback);
+
+    // Cause of the most recent move() rejection (kNone if the last move was allowed or none has
+    // been attempted yet). Read right after a move()/moveRelaxedStall() callback fires with
+    // ok=false, or after a synchronous `false` return, for typed attribution instead of a bare bool.
+    MoveBlockReason lastBlockReason() const { return lastMoveBlockReason; }
 
     // Control cleaning motors (brush, vacuum, side brush).
     // Returns false immediately if not active (caller gets 503).
@@ -51,11 +77,17 @@ public:
 
     bool isActive() const { return active; }
 
+    // Suppress the 5s client watchdog while a nav feature owns manual mode (an unattended
+    // route shouldn't be killed by "no HTTP request in 5s"). Reset to false on every fresh
+    // enable(true) success so a forgotten un-suppress can't leave the next owner unprotected.
+    void setClientWatchdogSuppressed(bool s) { clientWatchdogSuppressed = s; }
+
     // Update motor/safety settings from SettingsManager. Called at boot and on change.
     void setStallThreshold(int pct) { stallLoadPct = pct; }
     void setBrushRpm(int rpm) { brushRpm = rpm; }
     void setVacuumSpeed(int pct) { vacuumSpeedPct = pct; }
     void setSideBrushPower(int mw) { sideBrushMw = mw; }
+    void setDropThreshold(int mm) { dropThresholdMm = mm; } // Not wired to a setting yet
 
     // Return current safety + motor state as JSON (no serial I/O — reads in-memory flags)
     String getStatusJson() const;
@@ -79,9 +111,17 @@ private:
     bool bumperSideRight = false; // Right side bumper (blocks left turn only)
     bool wheelLifted = false; // Either wheel extended (robot picked up)
 
-    // Stall-induced virtual bumpers — set by stall detection, cleared on reverse move
-    bool stallFront = false; // Stall while moving forward → blocks forward
-    bool stallRear = false; // Stall while moving backward → blocks backward
+    // Stall-induced virtual bumpers — set by stall detection, cleared on reverse move or
+    // auto-cleared after enough consecutive clean polls. Decision logic (debounce/escape/
+    // auto-clear) lives in motion_safety.h so it's host-testable.
+    StallLatchState stallLatch;
+
+    // Drop/cliff sensor latch — sticky like stall, cleared on reverse move or auto-cleared.
+    // Decision logic (debounce/fail-closed/sticky/auto-clear) lives in drop_safety.h so it's
+    // host-testable.
+    DropLatchState dropLatch;
+
+    MoveBlockReason lastMoveBlockReason = MoveBlockReason::kNone;
 
     void tick() override; // Called every loop() iteration (intervalMs = 0)
 
@@ -89,18 +129,20 @@ private:
     Ticker safetyTicker; // MANUAL_SAFETY_POLL_MS
     Ticker stallTicker; // MANUAL_STALL_POLL_MS
     bool watchdogStopped = false; // True if watchdog already sent stop
+    bool clientWatchdogSuppressed = false; // True while a nav feature owns manual mode
 
     // Runtime motor/safety settings (defaults from config.h, updated by SettingsManager)
     int stallLoadPct = MANUAL_STALL_LOAD_PCT;
     int brushRpm = MANUAL_BRUSH_RPM;
     int vacuumSpeedPct = MANUAL_VACUUM_SPEED_PCT;
     int sideBrushMw = MANUAL_SIDE_BRUSH_POWER_MW;
+    int dropThresholdMm = MANUAL_DROP_THRESHOLD_MM;
 
     // Stall detection — tracks wheel load while moving
     bool wheelsMoving = false; // True between move() and stop/stall/disable
     int lastCmdLeftMM = 0; // Last commanded left wheel distance
     int lastCmdRightMM = 0; // Last commanded right wheel distance
-    int stallCount = 0; // Consecutive polls with overloaded wheels
+    bool stallRelaxedForCurrentMove = false; // True while the in-flight move used moveRelaxedStall()
 
     // Poll digital sensors for bumper/wheel-lift state
     void pollBumpers();
@@ -108,8 +150,14 @@ private:
     // Poll motor odometry while wheels are moving to detect stalls
     void pollStall();
 
-    // Check if a move command is safe given current obstacle state.
-    // Returns true if the move is allowed, false if blocked.
+    // Poll drop/cliff sensors — fresh read every call, bypasses the analog cache
+    void pollDrop();
+
+    // Shared implementation behind move()/moveRelaxedStall().
+    bool moveInternal(int leftMM, int rightMM, int speedMMs, std::function<void(bool)> callback, bool relaxedStall);
+
+    // Check if a move command is safe given current obstacle state (motion_safety.h). Sets
+    // lastMoveBlockReason. Returns true if the move is allowed, false if blocked.
     bool isMoveAllowed(int leftMM, int rightMM);
 
     // Stop all wheel movement immediately

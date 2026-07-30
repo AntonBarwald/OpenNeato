@@ -106,10 +106,55 @@ const loadHistorySessions = () => {
     return sessions;
 };
 
+// Seed Guided Clean annotations for the two-room demo fixture so the history
+// view opens pre-populated with a zone pair and a no-go line across the
+// corridor. Coordinates are robot-world meters, matching the pose frame.
+const loadZonesSeed = () => {
+    const zones = new Map();
+    zones.set("mapdata-guided-06.jsonl", {
+        zones: [
+            {
+                label: "Room A",
+                points: [
+                    { x: 0, y: 0 },
+                    { x: 2.5, y: 0 },
+                    { x: 2.5, y: 2.5 },
+                    { x: 0, y: 2.5 },
+                ],
+            },
+            {
+                label: "Room B",
+                points: [
+                    { x: 4, y: 0 },
+                    { x: 6.5, y: 0 },
+                    { x: 6.5, y: 2.5 },
+                    { x: 4, y: 2.5 },
+                ],
+            },
+        ],
+        noGoLines: [
+            {
+                points: [
+                    { x: 3.2, y: 0 },
+                    { x: 3.2, y: 2.5 },
+                ],
+            },
+        ],
+    });
+    return zones;
+};
+
+// Seed the two-room guided fixture as already pinned, so the #74 Guided
+// Clean start flow has a ready-to-use reference session without requiring a
+// manual pin step first.
+const loadPinnedSeed = () => new Set(["mapdata-guided-06.jsonl"]);
+
 const context = {
     state: {},
     faults: {},
     historySessions: loadHistorySessions(),
+    historyZones: loadZonesSeed(),
+    pinnedSessions: loadPinnedSeed(),
     rand,
     getVersion,
     getLidarScan,
@@ -129,39 +174,49 @@ const initScenario = (scenario) => {
     context.state = scenarioState.state;
     context.faults = scenarioState.faults;
     context.historySessions = loadHistorySessions();
+    context.historyZones = loadZonesSeed();
+    context.pinnedSessions = loadPinnedSeed();
+    recordingSim = null;
     bootTime = Date.now();
     initializedScenario = scenario;
 };
 
 initScenario("ok");
 
-const recordingFile = [...context.historySessions.entries()].find(
-    ([, lines]) => !lines.some((line) => line.includes('"type":"summary"')),
-);
+// Simulates pose updates for whichever session is currently recording; re-detected every
+// tick so it picks up a newly started guided session with no extra wiring.
+let recordingSim = null;
 
-if (recordingFile) {
+setInterval(() => {
+    const recordingFile = [...context.historySessions.entries()].find(
+        ([, lines]) => !lines.some((line) => line.includes('"type":"summary"')),
+    );
+    if (!recordingFile) {
+        recordingSim = null;
+        return;
+    }
     const [recordingName, recordingLines] = recordingFile;
-    const lastPose = [...recordingLines].reverse().find((line) => line.includes('"x":'));
-    const pos = lastPose ? JSON.parse(lastPose) : { x: 0, y: 0, t: 0, ts: 7244 };
-    let simX = pos.x;
-    let simY = pos.y;
-    let simT = pos.t;
-    let simTs = pos.ts;
+    if (!recordingSim || recordingSim.name !== recordingName) {
+        const lastPose = [...recordingLines].reverse().find((line) => line.includes('"x":'));
+        const pos = lastPose ? JSON.parse(lastPose) : { x: 0, y: 0, t: 0, ts: 0 };
+        recordingSim = { name: recordingName, x: pos.x, y: pos.y, t: pos.t, ts: pos.ts };
+        return;
+    }
 
-    setInterval(() => {
-        simT += (Math.random() - 0.5) * 30;
-        if (simT < 0) simT += 360;
-        if (simT >= 360) simT -= 360;
-        const rad = (simT * Math.PI) / 180;
-        const step = 0.08 + Math.random() * 0.12;
-        simX += Math.cos(rad) * step;
-        simY -= Math.sin(rad) * step;
-        simTs += 2.0 + Math.random() * 0.3;
-        const lines = context.historySessions.get(recordingName);
-        if (lines.length > 1) lines.splice(1, 1);
-        lines.push(`{"x":${simX.toFixed(3)},"y":${simY.toFixed(3)},"t":${simT.toFixed(1)},"ts":${simTs.toFixed(1)}}`);
-    }, 2000);
-}
+    recordingSim.t += (Math.random() - 0.5) * 30;
+    if (recordingSim.t < 0) recordingSim.t += 360;
+    if (recordingSim.t >= 360) recordingSim.t -= 360;
+    const rad = (recordingSim.t * Math.PI) / 180;
+    const step = 0.08 + Math.random() * 0.12;
+    recordingSim.x += Math.cos(rad) * step;
+    recordingSim.y -= Math.sin(rad) * step;
+    recordingSim.ts += 2.0 + Math.random() * 0.3;
+    const lines = context.historySessions.get(recordingName);
+    if (lines.length > 1) lines.splice(1, 1);
+    lines.push(
+        `{"x":${recordingSim.x.toFixed(3)},"y":${recordingSim.y.toFixed(3)},"t":${recordingSim.t.toFixed(1)},"ts":${recordingSim.ts.toFixed(1)}}`,
+    );
+}, 2000);
 
 const api = createMockApi(context);
 

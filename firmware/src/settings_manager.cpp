@@ -78,12 +78,34 @@ void SettingsManager::load() {
     current.autoRestartHour = prefs.getInt(NVS_KEY_AUTO_RESTART_HOUR, 3);
     current.autoRestartMinute = prefs.getInt(NVS_KEY_AUTO_RESTART_MIN, 0);
     current.restartBeforeClean = prefs.getBool(NVS_KEY_RESTART_BEFORE_CLEAN, false);
+    current.guidedScheduleArmed = prefs.getBool(NVS_KEY_SCHED_GUIDED_ARM, false);
+    bool foundLegacyGuidedSlot = false;
     for (int d = 0; d < SCHEDULE_DAYS; d++) {
         for (int s = 0; s < SCHEDULE_SLOTS_PER_DAY; s++) {
             current.sched[d].slots[s].hour = prefs.getInt(schedKey(d, s, "h").c_str(), 0);
             current.sched[d].slots[s].minute = prefs.getInt(schedKey(d, s, "m").c_str(), 0);
             current.sched[d].slots[s].on = prefs.getBool(schedKey(d, s, "on").c_str(), false);
+            // Missing key -> mode 0 = SCHED_MODE_HOUSE, identical to today's only behavior (§1.3, no migration needed).
+            current.sched[d].slots[s].mode =
+                    static_cast<SchedMode>(prefs.getInt(schedKey(d, s, "md").c_str(), SCHED_MODE_HOUSE));
+            current.sched[d].slots[s].guidedSession = prefs.getString(schedKey(d, s, "ssn").c_str(), "");
+            current.sched[d].slots[s].guidedZones = prefs.getString(schedKey(d, s, "zn").c_str(), "");
+
+            // Guided Clean is retired; apply() now refuses to ever write mode=2 again, but a
+            // slot persisted before this firmware still has it in NVS. Sanitize at boot too —
+            // not just on the frontend's one-shot, UI-visit-gated migration — so
+            // Scheduler::triggerGuidedClean() is unreachable from stored config regardless of
+            // whether anyone opens the Schedule page.
+            if (current.sched[d].slots[s].mode == SCHED_MODE_GUIDED) {
+                current.sched[d].slots[s].mode = SCHED_MODE_HOUSE;
+                current.sched[d].slots[s].on = false;
+                foundLegacyGuidedSlot = true;
+            }
         }
+    }
+    if (foundLegacyGuidedSlot) {
+        LOG("SETTINGS", "Retired schedule mode (guided) found in NVS -- downgraded affected slot(s) to house/off");
+        save();
     }
 }
 
@@ -113,11 +135,15 @@ void SettingsManager::save() {
     prefs.putInt(NVS_KEY_AUTO_RESTART_HOUR, current.autoRestartHour);
     prefs.putInt(NVS_KEY_AUTO_RESTART_MIN, current.autoRestartMinute);
     prefs.putBool(NVS_KEY_RESTART_BEFORE_CLEAN, current.restartBeforeClean);
+    prefs.putBool(NVS_KEY_SCHED_GUIDED_ARM, current.guidedScheduleArmed);
     for (int d = 0; d < SCHEDULE_DAYS; d++) {
         for (int s = 0; s < SCHEDULE_SLOTS_PER_DAY; s++) {
             prefs.putInt(schedKey(d, s, "h").c_str(), current.sched[d].slots[s].hour);
             prefs.putInt(schedKey(d, s, "m").c_str(), current.sched[d].slots[s].minute);
             prefs.putBool(schedKey(d, s, "on").c_str(), current.sched[d].slots[s].on);
+            prefs.putInt(schedKey(d, s, "md").c_str(), static_cast<int>(current.sched[d].slots[s].mode));
+            prefs.putString(schedKey(d, s, "ssn").c_str(), current.sched[d].slots[s].guidedSession);
+            prefs.putString(schedKey(d, s, "zn").c_str(), current.sched[d].slots[s].guidedZones);
         }
     }
 }
@@ -340,20 +366,38 @@ ApplyResult SettingsManager::apply(const String& json) {
         LOG("SETTINGS", "Restart before clean -> %s", current.restartBeforeClean ? "on" : "off");
     }
 
+    if (incoming.guidedScheduleArmed != current.guidedScheduleArmed) {
+        current.guidedScheduleArmed = incoming.guidedScheduleArmed;
+        changed = true;
+        LOG("SETTINGS", "Unattended guided schedule gate -> %s", current.guidedScheduleArmed ? "armed" : "disarmed");
+    }
+
     for (int d = 0; d < SCHEDULE_DAYS; d++) { // NOLINT(modernize-loop-convert) index needed for DAY_NAMES[d]
         for (int s = 0; s < SCHEDULE_SLOTS_PER_DAY; s++) {
             SchedSlot& cur = current.sched[d].slots[s];
             const SchedSlot& inc = incoming.sched[d].slots[s];
-            if (inc.hour != cur.hour || inc.minute != cur.minute || inc.on != cur.on) {
+            if (inc.hour != cur.hour || inc.minute != cur.minute || inc.on != cur.on || inc.mode != cur.mode ||
+                inc.guidedSession != cur.guidedSession || inc.guidedZones != cur.guidedZones) {
                 // Validate hour/minute ranges
                 if (inc.hour < 0 || inc.hour > 23 || inc.minute < 0 || inc.minute > 59)
+                    return APPLY_INVALID;
+                // Validate mode — guidedSession/guidedZones are NOT validated for
+                // existence here; a missing/unpinned/renamed reference is a
+                // fire-time concern (Scheduler::triggerGuidedClean), not save-time.
+                // SCHED_MODE_GUIDED is deliberately rejected: Guided Clean is retired (unsafe,
+                // unvalidated navigation) and must never be schedulable again, even though the
+                // enum value and Scheduler::triggerGuidedClean() stay in the tree, dormant.
+                if (inc.mode != SCHED_MODE_HOUSE && inc.mode != SCHED_MODE_SPOT)
                     return APPLY_INVALID;
                 cur.hour = inc.hour;
                 cur.minute = inc.minute;
                 cur.on = inc.on;
+                cur.mode = inc.mode;
+                cur.guidedSession = inc.guidedSession;
+                cur.guidedZones = inc.guidedZones;
                 changed = true;
-                LOG("SETTINGS", "Sched %s slot %d -> %02d:%02d %s", DAY_NAMES[d], s, cur.hour, cur.minute,
-                    cur.on ? "on" : "off");
+                LOG("SETTINGS", "Sched %s slot %d -> %02d:%02d %s mode=%d", DAY_NAMES[d], s, cur.hour, cur.minute,
+                    cur.on ? "on" : "off", static_cast<int>(cur.mode));
             }
         }
     }
@@ -398,6 +442,7 @@ std::vector<Field> Settings::toFields() const {
             {"autoRestartHour", String(autoRestartHour), FIELD_INT},
             {"autoRestartMinute", String(autoRestartMinute), FIELD_INT},
             {"restartBeforeClean", restartBeforeClean ? "true" : "false", FIELD_BOOL},
+            {"guidedScheduleArmed", guidedScheduleArmed ? "true" : "false", FIELD_BOOL},
     };
     for (int d = 0; d < SCHEDULE_DAYS; d++) {
         for (int s = 0; s < SCHEDULE_SLOTS_PER_DAY; s++) {
@@ -409,6 +454,9 @@ std::vector<Field> Settings::toFields() const {
             f.push_back({prefix + "Hour", String(sched[d].slots[s].hour), FIELD_INT});
             f.push_back({prefix + "Min", String(sched[d].slots[s].minute), FIELD_INT});
             f.push_back({prefix + "On", sched[d].slots[s].on ? "true" : "false", FIELD_BOOL});
+            f.push_back({prefix + "Mode", String(static_cast<int>(sched[d].slots[s].mode)), FIELD_INT});
+            f.push_back({prefix + "GuidedSession", sched[d].slots[s].guidedSession, FIELD_STRING});
+            f.push_back({prefix + "GuidedZones", sched[d].slots[s].guidedZones, FIELD_STRING});
         }
     }
     return f;
@@ -518,6 +566,10 @@ bool Settings::fromFields(const std::vector<Field>& fields) {
         restartBeforeClean = (f->value == "true");
         applied = true;
     }
+    if ((f = findField(fields, "guidedScheduleArmed")) && f->type == FIELD_BOOL) {
+        guidedScheduleArmed = (f->value == "true");
+        applied = true;
+    }
     for (int d = 0; d < SCHEDULE_DAYS; d++) { // NOLINT(modernize-loop-convert) index needed for field name prefix
         for (int s = 0; s < SCHEDULE_SLOTS_PER_DAY; s++) {
             String prefix = "sched" + String(d);
@@ -533,6 +585,18 @@ bool Settings::fromFields(const std::vector<Field>& fields) {
             }
             if ((f = findField(fields, (prefix + "On").c_str())) && f->type == FIELD_BOOL) {
                 sched[d].slots[s].on = (f->value == "true");
+                applied = true;
+            }
+            if ((f = findField(fields, (prefix + "Mode").c_str())) && f->type == FIELD_INT) {
+                sched[d].slots[s].mode = static_cast<SchedMode>(f->value.toInt());
+                applied = true;
+            }
+            if ((f = findField(fields, (prefix + "GuidedSession").c_str())) && f->type == FIELD_STRING) {
+                sched[d].slots[s].guidedSession = f->value;
+                applied = true;
+            }
+            if ((f = findField(fields, (prefix + "GuidedZones").c_str())) && f->type == FIELD_STRING) {
+                sched[d].slots[s].guidedZones = f->value;
                 applied = true;
             }
         }

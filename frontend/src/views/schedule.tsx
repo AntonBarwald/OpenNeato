@@ -2,8 +2,10 @@ import type { JSX } from "preact";
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import { api } from "../api";
 import backSvg from "../assets/icons/back.svg?raw";
+import houseSvg from "../assets/icons/house.svg?raw";
+import spotSvg from "../assets/icons/spot.svg?raw";
 import { ConfirmDialog } from "../components/confirm-dialog";
-import { ErrorBannerStack, useErrorStack } from "../components/error-banner";
+import { ErrorBanner, ErrorBannerStack, useErrorStack } from "../components/error-banner";
 import { Icon } from "../components/icon";
 import { TimeInput } from "../components/time-input";
 import { useDirtyGuard } from "../hooks/use-dirty-guard";
@@ -16,10 +18,17 @@ import { findCurrentTzAbbrev, findPresetLabel } from "./settings/helpers";
 const DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const SLOTS_PER_DAY = 2;
 
+// Retired NVS mode value — Guided Clean is no longer schedulable, but firmware still
+// accepts it, so existing installs may have a slot persisted with this value.
+const SCHED_MODE_GUIDED_LEGACY = 2;
+
+type SchedMode = "house" | "spot";
+
 interface SlotState {
     hour: number;
     minute: number;
     on: boolean;
+    mode: SchedMode;
 }
 
 interface DayState {
@@ -28,24 +37,62 @@ interface DayState {
 
 type SchedDay = 0 | 1 | 2 | 3 | 4 | 5 | 6;
 
+function slotPrefix(day: number, slotIndex: number): string {
+    return slotIndex === 0 ? `sched${day}` : `sched${day}Slot${slotIndex}`;
+}
+
+function modeFromNum(n: number | undefined): SchedMode {
+    if (n === 1) return "spot";
+    return "house";
+}
+
+function modeToNum(mode: SchedMode): number {
+    if (mode === "spot") return 1;
+    return 0;
+}
+
+// Reads one slot's 3 flattened SettingsData fields given its key prefix ("sched0" for slot
+// 0, "sched0Slot1" for slot 1) — mirrors the existing hour/min/on flattening convention.
+function readSlot(s: SettingsData, prefix: string): SlotState {
+    return {
+        hour: (s[`${prefix}Hour` as keyof SettingsData] as number) ?? 0,
+        minute: (s[`${prefix}Min` as keyof SettingsData] as number) ?? 0,
+        on: (s[`${prefix}On` as keyof SettingsData] as boolean) ?? false,
+        mode: modeFromNum(s[`${prefix}Mode` as keyof SettingsData] as number | undefined),
+    };
+}
+
 function readDays(s: SettingsData): DayState[] {
     const days: DayState[] = [];
     for (let d = 0; d < 7; d++) {
         const day = d as SchedDay;
-        const slot0: SlotState = {
-            hour: (s[`sched${day}Hour` as keyof SettingsData] as number) ?? 0,
-            minute: (s[`sched${day}Min` as keyof SettingsData] as number) ?? 0,
-            on: (s[`sched${day}On` as keyof SettingsData] as boolean) ?? false,
-        };
-        const slot1: SlotState = {
-            hour: (s[`sched${day}Slot1Hour` as keyof SettingsData] as number) ?? 0,
-            minute: (s[`sched${day}Slot1Min` as keyof SettingsData] as number) ?? 0,
-            on: (s[`sched${day}Slot1On` as keyof SettingsData] as boolean) ?? false,
-        };
+        const slot0 = readSlot(s, slotPrefix(day, 0));
+        const slot1 = readSlot(s, slotPrefix(day, 1));
         if (!slot0.on) slot1.on = false;
         days.push({ slots: [slot0, slot1] });
     }
     return days;
+}
+
+interface LegacyGuidedSlot {
+    day: number;
+    slotIndex: number;
+}
+
+// Guided Clean is retired from the UI, but firmware still accepts and fires mode=2
+// (settings_manager.cpp's validation wasn't tightened), so an install that armed a guided
+// slot before this shipped would otherwise keep running it unattended with no UI left to
+// see or disarm it. Reads the raw mode ints directly since SlotState/modeFromNum no longer
+// have a "guided" case to read them into.
+function findLegacyGuidedSlots(s: SettingsData): LegacyGuidedSlot[] {
+    const found: LegacyGuidedSlot[] = [];
+    for (let day = 0; day < 7; day++) {
+        for (let slotIndex = 0; slotIndex < SLOTS_PER_DAY; slotIndex++) {
+            const mode = s[`${slotPrefix(day, slotIndex)}Mode` as keyof SettingsData] as number | undefined;
+            if (mode === SCHED_MODE_GUIDED_LEGACY) found.push({ day, slotIndex });
+        }
+    }
+    return found;
 }
 
 function normalizeDays(days: DayState[]): DayState[] {
@@ -67,10 +114,11 @@ function buildSchedulePatch(days: DayState[], server: DayState[]): Partial<Setti
         for (let s = 0; s < SLOTS_PER_DAY; s++) {
             const cur = days[d].slots[s];
             const srv = server[d].slots[s];
-            const prefix = s === 0 ? `sched${d}` : `sched${d}Slot${s}`;
+            const prefix = slotPrefix(d, s);
             if (cur.hour !== srv.hour) patch[`${prefix}Hour`] = cur.hour;
             if (cur.minute !== srv.minute) patch[`${prefix}Min`] = cur.minute;
             if (cur.on !== srv.on) patch[`${prefix}On`] = cur.on;
+            if (cur.mode !== srv.mode) patch[`${prefix}Mode`] = modeToNum(cur.mode);
         }
     }
     return patch as Partial<SettingsData>;
@@ -121,6 +169,36 @@ function applyDrafts(days: DayState[], drafts: string[][]): DayState[] {
     );
 }
 
+const MODE_ICONS: Record<SchedMode, string> = { house: houseSvg, spot: spotSvg };
+const MODE_LABELS: Record<SchedMode, string> = { house: "House", spot: "Spot" };
+
+interface SlotModeToggleProps {
+    mode: SchedMode;
+    dayLabel: string;
+    onChange: (mode: SchedMode) => void;
+}
+
+// Compact 2-way segmented control.
+function SlotModeToggle({ mode, dayLabel, onChange }: SlotModeToggleProps) {
+    const { t } = useI18n();
+    return (
+        <div class="sched-mode-toggle">
+            {(Object.keys(MODE_ICONS) as SchedMode[]).map((m) => (
+                <button
+                    type="button"
+                    key={m}
+                    class={`sched-mode-btn${mode === m ? " active" : ""}`}
+                    onClick={() => onChange(m)}
+                    aria-label={t("{day}: {mode} clean", { day: dayLabel, mode: t(MODE_LABELS[m]) })}
+                    title={t(MODE_LABELS[m])}
+                >
+                    <Icon svg={MODE_ICONS[m]} />
+                </button>
+            ))}
+        </div>
+    );
+}
+
 export function ScheduleView() {
     const { t, formatSystemTime } = useI18n();
     const [errors, errorStack] = useErrorStack();
@@ -133,7 +211,12 @@ export function ScheduleView() {
     const [tz, setTz] = useState("UTC0");
     const [days, setDays] = useState<DayState[]>(() =>
         Array.from({ length: 7 }, () => ({
-            slots: Array.from({ length: SLOTS_PER_DAY }, () => ({ hour: 0, minute: 0, on: false })),
+            slots: Array.from({ length: SLOTS_PER_DAY }, () => ({
+                hour: 0,
+                minute: 0,
+                on: false,
+                mode: "house" as SchedMode,
+            })),
         })),
     );
 
@@ -143,22 +226,50 @@ export function ScheduleView() {
     // Set of "day-slot" keys with validation errors (populated at save time)
     const [invalidSlots, setInvalidSlots] = useState<Set<string>>(new Set());
 
+    // Set once this load found and disabled a retired guided slot. Naturally one-time: the
+    // migrating PATCH clears the persisted mode=2, so a later reload finds nothing left to
+    // migrate and this never gets set again.
+    const [legacyGuidedNotice, setLegacyGuidedNotice] = useState(false);
+
     // Server-confirmed state for dirty detection
     const serverDays = useRef<DayState[]>(days);
     const serverEnabled = useRef(false);
 
+    const applySettings = useCallback((res: SettingsData) => {
+        const d = normalizeDays(readDays(res));
+        setEnabled(res.scheduleEnabled);
+        serverEnabled.current = res.scheduleEnabled;
+        setTz(res.tz);
+        setDays(d);
+        setDrafts(daysToDrafts(d));
+        serverDays.current = d;
+        setInvalidSlots(new Set());
+    }, []);
+
     useEffect(() => {
-        if (settings) {
-            const d = normalizeDays(readDays(settings));
-            setEnabled(settings.scheduleEnabled);
-            serverEnabled.current = settings.scheduleEnabled;
-            setTz(settings.tz);
-            setDays(d);
-            setDrafts(daysToDrafts(d));
-            serverDays.current = d;
-            setInvalidSlots(new Set());
+        if (!settings) return;
+        const legacySlots = findLegacyGuidedSlots(settings);
+        if (legacySlots.length === 0) {
+            applySettings(settings);
+            return;
         }
-    }, [settings]);
+        // Retired Guided Clean would otherwise keep firing unattended on schedule — force
+        // the slot off and disarm the gate together, then apply whatever the server confirms.
+        const patch: Record<string, number | boolean> = { guidedScheduleArmed: false };
+        for (const { day, slotIndex } of legacySlots) {
+            const prefix = slotPrefix(day, slotIndex);
+            patch[`${prefix}Mode`] = 0;
+            patch[`${prefix}On`] = false;
+        }
+        api.saveSchedule(patch as Partial<SettingsData>)
+            .then((res) => {
+                applySettings(res);
+                setLegacyGuidedNotice(true);
+            })
+            .catch((e: unknown) => {
+                errorStack.push(normalizeError(e, "Failed to disable a retired Guided Clean schedule slot"));
+            });
+    }, [settings, applySettings, errorStack]);
 
     useEffect(() => {
         if (fetchError) errorStack.push(fetchError);
@@ -199,6 +310,13 @@ export function ScheduleView() {
             return next;
         });
     }, []);
+
+    const handleModeChange = useCallback(
+        (day: number, slot: number, mode: SchedMode) => {
+            updateSlot(day, slot, { mode });
+        },
+        [updateSlot],
+    );
 
     // Single batched save with validation
     const handleSave = useCallback(() => {
@@ -242,6 +360,36 @@ export function ScheduleView() {
             e.currentTarget.blur();
         }
     }, []);
+
+    const renderSlot = (day: number, slotIndex: number, slot: SlotState) => (
+        <div class="sched-slot-block">
+            <div class="sched-slot-row">
+                <TimeInput
+                    class={`sched-time-input${invalidSlots.has(`${day}-${slotIndex}`) ? " invalid" : ""}`}
+                    value={drafts[day][slotIndex]}
+                    maxLength={5}
+                    placeholder={t("HH:MM")}
+                    onInput={(v) => updateDraft(day, slotIndex, v)}
+                    onKeyDown={onKeyDown}
+                />
+                <SlotModeToggle
+                    mode={slot.mode}
+                    dayLabel={t(DAY_NAMES[day])}
+                    onChange={(mode) => handleModeChange(day, slotIndex, mode)}
+                />
+                {slotIndex === 1 && (
+                    <button
+                        type="button"
+                        class="sched-remove-btn"
+                        onClick={() => updateSlot(day, 1, { on: false })}
+                        aria-label={t("Remove {day} second slot", { day: t(DAY_NAMES[day]) })}
+                    >
+                        x
+                    </button>
+                )}
+            </div>
+        </div>
+    );
 
     return (
         <>
@@ -287,6 +435,17 @@ export function ScheduleView() {
                             />
                         </div>
 
+                        {legacyGuidedNotice && (
+                            <ErrorBanner
+                                variant="warning"
+                                title={t("Guided Clean retired")}
+                                message={t(
+                                    "A scheduled Guided clean was disabled — Guided Clean has been retired and is no longer available.",
+                                )}
+                                onDismiss={() => setLegacyGuidedNotice(false)}
+                            />
+                        )}
+
                         <div class="schedule-tz-hint">
                             {system?.localTime
                                 ? `${formatSystemTime(system.localTime)} - ${tzLabel(tz, system.isDst)}`
@@ -310,39 +469,9 @@ export function ScheduleView() {
                                         <span class={`sched-day-label${s0.on ? "" : " off"}`}>{t(DAY_NAMES[i])}</span>
 
                                         <div class="sched-slots">
-                                            {s0.on && (
-                                                <TimeInput
-                                                    class={`sched-time-input${invalidSlots.has(`${i}-0`) ? " invalid" : ""}`}
-                                                    value={drafts[i][0]}
-                                                    maxLength={5}
-                                                    placeholder={t("HH:MM")}
-                                                    onInput={(v) => updateDraft(i, 0, v)}
-                                                    onKeyDown={onKeyDown}
-                                                />
-                                            )}
+                                            {s0.on && renderSlot(i, 0, s0)}
 
-                                            {s0.on && s1.on && (
-                                                <div class="sched-slot2-wrap">
-                                                    <TimeInput
-                                                        class={`sched-time-input${invalidSlots.has(`${i}-1`) ? " invalid" : ""}`}
-                                                        value={drafts[i][1]}
-                                                        maxLength={5}
-                                                        placeholder={t("HH:MM")}
-                                                        onInput={(v) => updateDraft(i, 1, v)}
-                                                        onKeyDown={onKeyDown}
-                                                    />
-                                                    <button
-                                                        type="button"
-                                                        class="sched-remove-btn"
-                                                        onClick={() => updateSlot(i, 1, { on: false })}
-                                                        aria-label={t("Remove {day} second slot", {
-                                                            day: t(DAY_NAMES[i]),
-                                                        })}
-                                                    >
-                                                        x
-                                                    </button>
-                                                </div>
-                                            )}
+                                            {s0.on && s1.on && renderSlot(i, 1, s1)}
                                             {s0.on && !s1.on && (
                                                 <button
                                                     type="button"
@@ -384,7 +513,7 @@ export function ScheduleView() {
     );
 }
 
-// Check if drafts differ from server state (accounts for toggle changes + text edits)
+// Check if drafts differ from server state (accounts for toggle changes + text edits + mode)
 function draftsMatchDays(drafts: string[][], days: DayState[], server: DayState[]): boolean {
     for (let d = 0; d < 7; d++) {
         for (let s = 0; s < SLOTS_PER_DAY; s++) {
@@ -392,6 +521,7 @@ function draftsMatchDays(drafts: string[][], days: DayState[], server: DayState[
             const srv = server[d].slots[s];
             // Toggle state changed
             if (cur.on !== srv.on) return false;
+            if (cur.mode !== srv.mode) return false;
             // For enabled slots, check if draft text resolves to a different time
             if (cur.on) {
                 const parsed = parseTime(drafts[d][s]);

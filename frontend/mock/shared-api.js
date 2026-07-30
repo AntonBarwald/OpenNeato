@@ -191,15 +191,14 @@ const settingsPayload = (state, includeNavMode = true) => {
         "autoRestartHour",
         "autoRestartMinute",
         "restartBeforeClean",
+        "guidedScheduleArmed",
     ];
     for (const key of keys) settings[key] = state[key];
     for (let day = 0; day < 7; day++) {
-        settings[`sched${day}Hour`] = state[`sched${day}Hour`];
-        settings[`sched${day}Min`] = state[`sched${day}Min`];
-        settings[`sched${day}On`] = state[`sched${day}On`];
-        settings[`sched${day}Slot1Hour`] = state[`sched${day}Slot1Hour`];
-        settings[`sched${day}Slot1Min`] = state[`sched${day}Slot1Min`];
-        settings[`sched${day}Slot1On`] = state[`sched${day}Slot1On`];
+        for (const suffix of ["Hour", "Min", "On", "Mode", "GuidedSession", "GuidedZones"]) {
+            settings[`sched${day}${suffix}`] = state[`sched${day}${suffix}`];
+            settings[`sched${day}Slot1${suffix}`] = state[`sched${day}Slot1${suffix}`];
+        }
     }
     return settings;
 };
@@ -222,7 +221,7 @@ const injectCorruptedPoses = (lines) => {
     return result;
 };
 
-const listHistory = (historySessions, faults) => {
+const listHistory = (historySessions, faults, pinnedSessions) => {
     const list = [...historySessions.entries()].map(([name, lines]) => {
         let session = null;
         let summary = null;
@@ -246,6 +245,7 @@ const listHistory = (historySessions, faults) => {
             recording: summary === null,
             session,
             summary,
+            pinned: pinnedSessions?.has(name) ?? false,
         };
     });
 
@@ -295,6 +295,60 @@ const parseMultipartJsonlUpload = (bodyBytes) => {
     }
 
     return { filename, lines };
+};
+
+// Ends the in-progress guided-clean recording session by appending a summary line, so it
+// shows up finished like a house/spot clean. Called from the stop action and from /api/clean.
+const finalizeGuidedSession = (context) => {
+    const active = context.state.guidedActive;
+    if (!active) return;
+    const lines = context.historySessions.get(active.session);
+    if (lines) {
+        let battery = 100;
+        try {
+            const header = JSON.parse(lines[0]);
+            battery = header.battery ?? battery;
+        } catch {}
+
+        let distance = 0;
+        let maxDist = 0;
+        let lastTs = 0;
+        let snapshots = 0;
+        let prev = null;
+        for (const line of lines) {
+            if (!line.includes('"x":')) continue;
+            let pose;
+            try {
+                pose = JSON.parse(line);
+            } catch {
+                continue;
+            }
+            snapshots++;
+            if (prev) distance += Math.hypot(pose.x - prev.x, pose.y - prev.y);
+            maxDist = Math.max(maxDist, Math.hypot(pose.x, pose.y));
+            lastTs = pose.ts;
+            prev = pose;
+        }
+
+        lines.push(
+            JSON.stringify({
+                type: "summary",
+                time: Math.floor(Date.now() / 1000),
+                duration: Math.round(lastTs),
+                mode: "guided",
+                recharges: 0,
+                snapshots,
+                distanceTraveled: Number(distance.toFixed(2)),
+                maxDistFromOrigin: Number(maxDist.toFixed(2)),
+                totalRotation: 0,
+                areaCovered: Number((distance * 0.3).toFixed(2)),
+                errorsDuringClean: 0,
+                batteryStart: battery,
+                batteryEnd: Math.max(0, battery - Math.round(lastTs / 90)),
+            }),
+        );
+    }
+    context.state.guidedActive = null;
 };
 
 const extractFirmwarePayload = (bodyBytes) => {
@@ -422,7 +476,31 @@ function createMockApi(context) {
                 errorCode: state.errorCode,
                 errorMessage: state.errorMessage,
                 displayMessage: state.displayMessage,
+                recoveryHint: state.recoveryHint,
             });
+        }
+
+        if (method === "GET" && path === "/api/maintenance") {
+            return jsonResponse({
+                brushHours: state.brushHours,
+                filterHours: state.filterHours,
+                sideBrushHours: state.sideBrushHours,
+                sensorHours: state.sensorHours,
+                brushIntervalHours: 200,
+                filterIntervalHours: 100,
+                sideBrushIntervalHours: 150,
+                sensorIntervalHours: 30,
+            });
+        }
+
+        if (method === "POST" && path === "/api/maintenance/reset") {
+            const item = query.item;
+            if (item === "brush") state.brushHours = 0;
+            else if (item === "filter") state.filterHours = 0;
+            else if (item === "sideBrush") state.sideBrushHours = 0;
+            else if (item === "sensors") state.sensorHours = 0;
+            else return errorResponse("invalid item", 400);
+            return okResponse();
         }
 
         if (method === "GET" && path === "/api/lidar") {
@@ -447,6 +525,7 @@ function createMockApi(context) {
             const action = query.action || "house";
             if (action === "dock") {
                 if (state.cleaning || state.spotCleaning) {
+                    if (state.guidedActive) finalizeGuidedSession(context);
                     state.docking = true;
                     state.cleaning = false;
                     state.spotCleaning = false;
@@ -455,6 +534,7 @@ function createMockApi(context) {
             } else if (action === "pause") {
                 if ((state.cleaning || state.spotCleaning) && !state.paused) state.paused = true;
             } else if (action === "stop") {
+                if (state.guidedActive) finalizeGuidedSession(context);
                 state.cleaning = false;
                 state.spotCleaning = false;
                 state.docking = false;
@@ -464,6 +544,22 @@ function createMockApi(context) {
                 state.cleaning = false;
                 state.docking = false;
                 state.paused = false;
+                // Mirror clampSpotDimension()'s clamp -- not surfaced in any mock scenario yet, kept for parity.
+                const clampSpot = (raw) => {
+                    const n = Number(raw) || 0;
+                    if (n <= 0) return -1;
+                    return Math.min(400, Math.max(100, n));
+                };
+                const w = clampSpot(query.width);
+                const h = clampSpot(query.height);
+                // width/height are all-or-nothing -- half-specified falls back to default size.
+                if (w < 0 || h < 0) {
+                    state.spotWidthCm = -1;
+                    state.spotHeightCm = -1;
+                } else {
+                    state.spotWidthCm = w;
+                    state.spotHeightCm = h;
+                }
             } else {
                 state.cleaning = true;
                 state.spotCleaning = false;
@@ -766,10 +862,13 @@ function createMockApi(context) {
             return textResponse(`${cmd}\r\nMock response for: ${cmd}\r\n\x1a`, 200, { "Content-Type": "text/plain" });
         }
 
-        if (method === "GET" && path === "/api/history") return listHistory(context.historySessions, faults);
+        if (method === "GET" && path === "/api/history")
+            return listHistory(context.historySessions, faults, context.pinnedSessions);
 
         if (method === "DELETE" && path === "/api/history") {
             context.historySessions.clear();
+            context.historyZones?.clear();
+            context.pinnedSessions?.clear();
             return okResponse();
         }
 
@@ -785,6 +884,57 @@ function createMockApi(context) {
             return okResponse();
         }
 
+        // Guided Clean zone/no-go-line storage. Matched BEFORE the generic
+        // history route below, whose greedy /(.+)/ would otherwise swallow the
+        // "<name>/zones" suffix as a filename.
+        const zonesMatch = path.match(/^\/api\/history\/([^/]+)\/zones$/);
+        if (zonesMatch) {
+            const filename = decodeURIComponent(zonesMatch[1]);
+            if (!context.historySessions.has(filename)) return errorResponse("session not found", 404);
+            if (method === "GET") {
+                // Match firmware: a session with no saved zones 404s rather than
+                // returning a default empty blob, so this case can't hide in dev.
+                const stored = context.historyZones?.get(filename);
+                if (!stored) return errorResponse("no zones for session", 404);
+                return jsonResponse(stored);
+            }
+            if (method === "PUT") {
+                let body;
+                try {
+                    body = JSON.parse(await request.text());
+                } catch {
+                    return errorResponse("invalid JSON", 400);
+                }
+                context.historyZones?.set(filename, body);
+                return jsonResponse(body);
+            }
+            if (method === "DELETE") {
+                context.historyZones?.delete(filename);
+                return okResponse();
+            }
+            return errorResponse("method not allowed", 405);
+        }
+
+        // Pinning marks a finished session as a reference map the guided start picker can
+        // offer; matched before the generic history route for the same reason as /zones above.
+        const pinMatch = path.match(/^\/api\/history\/([^/]+)\/pin$/);
+        if (pinMatch) {
+            const filename = decodeURIComponent(pinMatch[1]);
+            const lines = context.historySessions.get(filename);
+            if (!lines) return errorResponse("session not found", 404);
+            if (method === "POST") {
+                const recording = !lines.some((line) => line.includes('"type":"summary"'));
+                if (recording) return errorResponse("cannot pin a session that is still recording", 400);
+                context.pinnedSessions?.add(filename);
+                return okResponse();
+            }
+            if (method === "DELETE") {
+                context.pinnedSessions?.delete(filename);
+                return okResponse();
+            }
+            return errorResponse("method not allowed", 405);
+        }
+
         const historyMatch = path.match(/^\/api\/history\/(.+)$/);
         if (historyMatch) {
             const filename = decodeURIComponent(historyMatch[1]);
@@ -796,9 +946,90 @@ function createMockApi(context) {
             }
             if (method === "DELETE") {
                 context.historySessions.delete(filename);
+                context.historyZones?.delete(filename);
+                context.pinnedSessions?.delete(filename);
                 return okResponse();
             }
             return errorResponse("method not allowed", 405);
+        }
+
+        // Starts a new recording session referencing a pinned session's saved zones/no-go
+        // lines; shows up in /api/history (recording:true) immediately.
+        if (method === "POST" && path === "/api/guided") {
+            if (faults.actions) return errorResponse("UART timeout: robot not responding", 500);
+            const action = query.action;
+            if (action === "start") {
+                const referenceSession = query.session;
+                if (!referenceSession) return errorResponse("missing session", 400);
+                if (!context.historySessions.has(referenceSession)) {
+                    return errorResponse("reference session not found", 404);
+                }
+                if (!context.pinnedSessions?.has(referenceSession)) {
+                    return errorResponse("reference session is not pinned", 400);
+                }
+                const zonesBlob = context.historyZones?.get(referenceSession) ?? { zones: [], noGoLines: [] };
+                if (zonesBlob.zones.length === 0 && zonesBlob.noGoLines.length === 0) {
+                    return errorResponse("reference session has no zones or no-go lines defined", 400);
+                }
+                if (!state.extPwrPresent) {
+                    return errorResponse("Robot must be docked to start a guided clean", 409);
+                }
+                if (state.cleaning || state.spotCleaning || state.manualClean || state.guidedActive) {
+                    return errorResponse("Robot is already busy cleaning", 409);
+                }
+                const zoneLabels = query.zones
+                    ? query.zones
+                          .split(",")
+                          .map((s) => s.trim())
+                          .filter(Boolean)
+                    : [];
+                const fuel = Math.round(state.fuelPercent);
+                const time = Math.floor(Date.now() / 1000);
+                const filename = `${time}.jsonl`;
+                context.historySessions.set(filename, [
+                    JSON.stringify({ type: "session", mode: "guided", time, battery: fuel }),
+                ]);
+                state.cleaning = true;
+                state.spotCleaning = false;
+                state.docking = false;
+                state.paused = false;
+                state.guidedActive = { session: filename, referenceSession, zones: zoneLabels };
+                deriveStates(state);
+                context.onRecordingChanged?.();
+                return jsonResponse({ ok: true, session: filename });
+            }
+            if (action === "stop") {
+                finalizeGuidedSession(context);
+                state.cleaning = false;
+                state.spotCleaning = false;
+                state.docking = false;
+                state.paused = false;
+                deriveStates(state);
+                return okResponse();
+            }
+            return errorResponse("unknown action", 400);
+        }
+
+        // Point-navigation stub — reserved for a future targeted-drive
+        // action; currently a no-op so the guided flow has a wired endpoint
+        // to call once real point navigation lands.
+        if (method === "POST" && path === "/api/navigate") {
+            if (faults.actions) return errorResponse("UART timeout: robot not responding", 500);
+            return okResponse();
+        }
+
+        // Mode-card demo (#2): active/inactive is all DashboardView reads,
+        // so this doesn't simulate the full undocking/rotating/... state machine.
+        if (method === "GET" && path === "/api/guided/status") {
+            const active = state.guidedActive;
+            return jsonResponse({
+                active: !!active,
+                state: active ? "driving" : "idle",
+                session: active?.session ?? "",
+                waypointIndex: active ? 12 : 0,
+                waypointCount: active ? 40 : 0,
+                hasPose: !!active,
+            });
         }
 
         return false;

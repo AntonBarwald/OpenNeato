@@ -28,6 +28,8 @@ tags:
     description: ESP32 firmware version and OTA update
   - name: History
     description: Cleaning session history and map data
+  - name: Navigation
+    description: Waypoint-driven navigation (#70 proof of concept, #71 Guided Clean)
 paths:
   /api/version:
     get:
@@ -256,6 +258,32 @@ paths:
               - pause
               - stop
               - dock
+        - name: width
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 400
+            default: 0
+          description: >-
+            Spot-clean width in cm (100-400). 0 or omitted = robot default. Ignored for
+            non-spot actions. width and height are all-or-nothing: if only one is given
+            (or either is 0), the request silently falls back to the robot's default size
+            rather than erroring.
+        - name: height
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 400
+            default: 0
+          description: >-
+            Spot-clean height in cm (100-400). 0 or omitted = robot default. Ignored for
+            non-spot actions. width and height are all-or-nothing: if only one is given
+            (or either is 0), the request silently falls back to the robot's default size
+            rather than erroring.
       responses:
         "200":
           $ref: "#/components/responses/Ok"
@@ -267,6 +295,55 @@ paths:
                 $ref: "#/components/schemas/Error"
         "504":
           description: robot timeout
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /api/clean-timer:
+    get:
+      tags:
+        - Actions
+      summary: Get the whole-house early-return timer status (no serial I/O)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CleanTimerStatus"
+    post:
+      tags:
+        - Actions
+      summary: Arm or cancel the whole-house early-return timer (no serial I/O)
+      description: >-
+        Arms a timer that docks the robot (via the same SetEvent path as the Home button) after
+        the given number of minutes, or cancels a previously armed one. Firmware-enforced: the
+        timer is tied to the clean session it was armed for and self-disarms if that clean ends
+        (any way) or a different clean starts, so it can never dock an unrelated later clean.
+        The dashboard's best-effort cancel before dispatching other clean actions is a fast-path
+        on top of this, not what makes it correct.
+      parameters:
+        - name: action
+          in: query
+          required: true
+          schema:
+            type: string
+            enum:
+              - arm
+              - cancel
+        - name: minutes
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1440
+          description: Required when action=arm (1-1440, i.e. up to 24h); ignored for action=cancel.
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+        "400":
+          description: missing/invalid action, or missing/out-of-range minutes for action=arm
           content:
             application/json:
               schema:
@@ -372,6 +449,39 @@ paths:
                 $ref: "#/components/schemas/Error"
         "504":
           description: robot timeout
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /api/maintenance:
+    get:
+      tags:
+        - Sensors
+      summary: Get hours-used and replacement interval per consumable (brush, filter, side brush, sensors)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MaintenanceData"
+  /api/maintenance/reset:
+    post:
+      tags:
+        - Actions
+      summary: Reset a consumable's usage counter to zero (records the reset point, does not erase history)
+      parameters:
+        - name: item
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [brush, filter, sideBrush, sensors]
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+        "400":
+          description: invalid item
           content:
             application/json:
               schema:
@@ -855,6 +965,107 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+  /api/navigate/status:
+    get:
+      tags:
+        - Navigation
+      summary: Get #70 proof-of-concept navigation status (no serial I/O)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NavigateStatus"
+  /api/navigate/stop:
+    post:
+      tags:
+        - Navigation
+      summary: Abort the #70 proof-of-concept drive (idempotent)
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+  /api/navigate:
+    post:
+      tags:
+        - Navigation
+      summary: Start the #70 proof-of-concept drive through a flat waypoint list
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: "#/components/schemas/NavWaypoint"
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+        "409":
+          description: navigation already in progress, or the waypoint array is invalid/empty/too large
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /api/guided/status:
+    get:
+      tags:
+        - Navigation
+      summary: Get #71 Guided Clean state machine status (no serial I/O)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GuidedStatus"
+  /api/guided:
+    post:
+      tags:
+        - Navigation
+      summary: Stop a #71 Guided Clean route replay (action=start is retired, see below)
+      description: >-
+        Guided Clean is retired: its navigation is unvalidated (proven infeasible, with an
+        uncalibrated cliff-sensor backstop). action=start always returns 409 and never starts
+        anything — kept in the enum only so a caller gets an explicit rejection instead of a
+        404. action=stop is kept fully working as a no-cost safety brake even though nothing
+        can start a run anymore.
+      parameters:
+        - name: action
+          in: query
+          required: true
+          schema:
+            type: string
+            enum:
+              - start
+              - stop
+        - name: session
+          in: query
+          required: false
+          description: Session filename — accepted for action=start but unused; that action always refuses. e.g. "1690000000.jsonl.hs"
+          schema:
+            type: string
+        - name: zones
+          in: query
+          required: false
+          description: Accepted for action=start but unused; that action always refuses.
+          schema:
+            type: string
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+        "400":
+          description: missing action, or invalid action
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: action=start (always — Guided Clean is retired)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 components:
   schemas:
     Ok:
@@ -1108,12 +1319,16 @@ components:
         displayMessage:
           type: string
           description: Human-readable message suitable for UI and notifications
+        recoveryHint:
+          type: string
+          description: Short actionable next step for the user, empty string if none applies
       required:
         - hasError
         - kind
         - errorCode
         - errorMessage
         - displayMessage
+        - recoveryHint
     LidarScan:
       type: object
       properties:
@@ -1401,90 +1616,180 @@ components:
         restartBeforeClean:
           type: boolean
           description: Restart the robot before each scheduled clean to ensure responsiveness
+        guidedScheduleArmed:
+          type: boolean
+          description: Retired along with schedule mode 2 (guided) — kept for backward compatibility only; no schedule slot can fire a guided clean regardless of this gate's value.
         sched0Hour:
           type: number
         sched0Min:
           type: number
         sched0On:
           type: boolean
+        sched0Mode:
+          type: number
+          description: 0=house, 1=spot. 2 (guided) is retired — PUT rejects it, and any legacy 2 already in NVS is downgraded to 0/off at boot.
+        sched0GuidedSession:
+          type: string
+          description: Reference session filename for a guided slot (empty = unset)
+        sched0GuidedZones:
+          type: string
+          description: Comma-joined zone labels to restrict a guided slot to (empty = whole house)
         sched1Hour:
           type: number
         sched1Min:
           type: number
         sched1On:
           type: boolean
+        sched1Mode:
+          type: number
+        sched1GuidedSession:
+          type: string
+        sched1GuidedZones:
+          type: string
         sched2Hour:
           type: number
         sched2Min:
           type: number
         sched2On:
           type: boolean
+        sched2Mode:
+          type: number
+        sched2GuidedSession:
+          type: string
+        sched2GuidedZones:
+          type: string
         sched3Hour:
           type: number
         sched3Min:
           type: number
         sched3On:
           type: boolean
+        sched3Mode:
+          type: number
+        sched3GuidedSession:
+          type: string
+        sched3GuidedZones:
+          type: string
         sched4Hour:
           type: number
         sched4Min:
           type: number
         sched4On:
           type: boolean
+        sched4Mode:
+          type: number
+        sched4GuidedSession:
+          type: string
+        sched4GuidedZones:
+          type: string
         sched5Hour:
           type: number
         sched5Min:
           type: number
         sched5On:
           type: boolean
+        sched5Mode:
+          type: number
+        sched5GuidedSession:
+          type: string
+        sched5GuidedZones:
+          type: string
         sched6Hour:
           type: number
         sched6Min:
           type: number
         sched6On:
           type: boolean
+        sched6Mode:
+          type: number
+        sched6GuidedSession:
+          type: string
+        sched6GuidedZones:
+          type: string
         sched0Slot1Hour:
           type: number
         sched0Slot1Min:
           type: number
         sched0Slot1On:
           type: boolean
+        sched0Slot1Mode:
+          type: number
+        sched0Slot1GuidedSession:
+          type: string
+        sched0Slot1GuidedZones:
+          type: string
         sched1Slot1Hour:
           type: number
         sched1Slot1Min:
           type: number
         sched1Slot1On:
           type: boolean
+        sched1Slot1Mode:
+          type: number
+        sched1Slot1GuidedSession:
+          type: string
+        sched1Slot1GuidedZones:
+          type: string
         sched2Slot1Hour:
           type: number
         sched2Slot1Min:
           type: number
         sched2Slot1On:
           type: boolean
+        sched2Slot1Mode:
+          type: number
+        sched2Slot1GuidedSession:
+          type: string
+        sched2Slot1GuidedZones:
+          type: string
         sched3Slot1Hour:
           type: number
         sched3Slot1Min:
           type: number
         sched3Slot1On:
           type: boolean
+        sched3Slot1Mode:
+          type: number
+        sched3Slot1GuidedSession:
+          type: string
+        sched3Slot1GuidedZones:
+          type: string
         sched4Slot1Hour:
           type: number
         sched4Slot1Min:
           type: number
         sched4Slot1On:
           type: boolean
+        sched4Slot1Mode:
+          type: number
+        sched4Slot1GuidedSession:
+          type: string
+        sched4Slot1GuidedZones:
+          type: string
         sched5Slot1Hour:
           type: number
         sched5Slot1Min:
           type: number
         sched5Slot1On:
           type: boolean
+        sched5Slot1Mode:
+          type: number
+        sched5Slot1GuidedSession:
+          type: string
+        sched5Slot1GuidedZones:
+          type: string
         sched6Slot1Hour:
           type: number
         sched6Slot1Min:
           type: number
         sched6Slot1On:
           type: boolean
+        sched6Slot1Mode:
+          type: number
+        sched6Slot1GuidedSession:
+          type: string
+        sched6Slot1GuidedZones:
+          type: string
       required:
         - tz
         - logLevel
@@ -1512,48 +1817,91 @@ components:
         - autoRestartHour
         - autoRestartMinute
         - restartBeforeClean
+        - guidedScheduleArmed
         - sched0Hour
         - sched0Min
         - sched0On
+        - sched0Mode
+        - sched0GuidedSession
+        - sched0GuidedZones
         - sched1Hour
         - sched1Min
         - sched1On
+        - sched1Mode
+        - sched1GuidedSession
+        - sched1GuidedZones
         - sched2Hour
         - sched2Min
         - sched2On
+        - sched2Mode
+        - sched2GuidedSession
+        - sched2GuidedZones
         - sched3Hour
         - sched3Min
         - sched3On
+        - sched3Mode
+        - sched3GuidedSession
+        - sched3GuidedZones
         - sched4Hour
         - sched4Min
         - sched4On
+        - sched4Mode
+        - sched4GuidedSession
+        - sched4GuidedZones
         - sched5Hour
         - sched5Min
         - sched5On
+        - sched5Mode
+        - sched5GuidedSession
+        - sched5GuidedZones
         - sched6Hour
         - sched6Min
         - sched6On
+        - sched6Mode
+        - sched6GuidedSession
+        - sched6GuidedZones
         - sched0Slot1Hour
         - sched0Slot1Min
         - sched0Slot1On
+        - sched0Slot1Mode
+        - sched0Slot1GuidedSession
+        - sched0Slot1GuidedZones
         - sched1Slot1Hour
         - sched1Slot1Min
         - sched1Slot1On
+        - sched1Slot1Mode
+        - sched1Slot1GuidedSession
+        - sched1Slot1GuidedZones
         - sched2Slot1Hour
         - sched2Slot1Min
         - sched2Slot1On
+        - sched2Slot1Mode
+        - sched2Slot1GuidedSession
+        - sched2Slot1GuidedZones
         - sched3Slot1Hour
         - sched3Slot1Min
         - sched3Slot1On
+        - sched3Slot1Mode
+        - sched3Slot1GuidedSession
+        - sched3Slot1GuidedZones
         - sched4Slot1Hour
         - sched4Slot1Min
         - sched4Slot1On
+        - sched4Slot1Mode
+        - sched4Slot1GuidedSession
+        - sched4Slot1GuidedZones
         - sched5Slot1Hour
         - sched5Slot1Min
         - sched5Slot1On
+        - sched5Slot1Mode
+        - sched5Slot1GuidedSession
+        - sched5Slot1GuidedZones
         - sched6Slot1Hour
         - sched6Slot1Min
         - sched6Slot1On
+        - sched6Slot1Mode
+        - sched6Slot1GuidedSession
+        - sched6Slot1GuidedZones
     FirmwareVersion:
       type: object
       properties:
@@ -1772,6 +2120,200 @@ components:
             $ref: "#/components/schemas/WiFiNetwork"
       required:
         - networks
+    NavWaypoint:
+      type: object
+      description: Flat point in robot-world meters (point_array_json.h format). "t" is accepted but ignored by #70 — heading is derived from consecutive waypoints.
+      properties:
+        x:
+          type: number
+          description: Robot-world X coordinate in meters
+        y:
+          type: number
+          description: Robot-world Y coordinate in meters
+        t:
+          type: number
+          description: Heading in degrees (optional, ignored by #70 navigation)
+      required:
+        - x
+        - y
+    NavigateStatus:
+      type: object
+      properties:
+        active:
+          type: boolean
+          description: A #70 proof-of-concept drive is currently in progress
+        state:
+          type: string
+          enum:
+            - idle
+            - enabling
+            - rotating
+            - driving
+            - done
+            - error
+          description: Current drive-loop state
+        waypointIndex:
+          type: number
+          description: Index of the current target waypoint
+        waypointCount:
+          type: number
+          description: Total waypoints in the active route
+        hasPose:
+          type: boolean
+          description: At least one GetRobotPos Raw fix has been received (Smooth is frozen in TestMode)
+        lastX:
+          type: number
+          description: Last known robot X position in meters
+        lastY:
+          type: number
+          description: Last known robot Y position in meters
+        lastTheta:
+          type: number
+          description: Last known robot heading in degrees
+        lastDistM:
+          type: number
+          description: Distance to the current target waypoint in meters, from the last pose fix
+        lastHeadingErrDeg:
+          type: number
+          description: Heading error to the current target waypoint in degrees, from the last pose fix
+        error:
+          type: string
+          description: Last error message, empty if none
+      required:
+        - active
+        - state
+        - waypointIndex
+        - waypointCount
+        - hasPose
+        - lastX
+        - lastY
+        - lastTheta
+        - lastDistM
+        - lastHeadingErrDeg
+        - error
+    GuidedStatus:
+      type: object
+      properties:
+        active:
+          type: boolean
+          description: A #71 Guided Clean route is currently in progress
+        state:
+          type: string
+          enum:
+            - idle
+            - validating
+            - undocking
+            - rotating
+            - driving
+            - correcting
+            - docking
+            - charging
+            - done
+            - error
+          description: Current state machine state
+        session:
+          type: string
+          description: Session filename the active/last route was loaded from
+        waypointIndex:
+          type: number
+          description: Index of the current target waypoint
+        waypointCount:
+          type: number
+          description: Total waypoints in the planned route (after downsampling and zone filtering)
+        hasPose:
+          type: boolean
+          description: At least one GetRobotPos Raw fix has been received (Smooth is frozen in TestMode)
+        lastX:
+          type: number
+          description: Last known robot X position in meters
+        lastY:
+          type: number
+          description: Last known robot Y position in meters
+        lastTheta:
+          type: number
+          description: Last known robot heading in degrees
+        pausedForCharge:
+          type: boolean
+          description: Route is paused at the dock for a low-battery recharge
+        rerouteCount:
+          type: number
+          description: Consecutive local reroutes since the last waypoint was reached
+        traveledDistanceM:
+          type: number
+          description: Cumulative odometry distance actually driven this route, meters — compare against the NAV_MGR_MAX_ODOM_PATH_M guard
+        truncated:
+          type: boolean
+          description: The planned route was shortened at plan time to fit the odometry budget; some of the selected area won't be covered this run
+        plannedPathM:
+          type: number
+          description: Pre-truncation planned route length, meters (the "would have been" figure) — compare to waypointCount's post-truncation count
+        error:
+          type: string
+          description: Last error message, empty if none
+      required:
+        - active
+        - state
+        - session
+        - waypointIndex
+        - waypointCount
+        - hasPose
+        - lastX
+        - lastY
+        - lastTheta
+        - pausedForCharge
+        - rerouteCount
+        - traveledDistanceM
+        - truncated
+        - plannedPathM
+        - error
+    CleanTimerStatus:
+      type: object
+      properties:
+        armed:
+          type: boolean
+          description: The whole-house early-return timer is currently armed
+        remainingSec:
+          type: number
+          description: Seconds until the timer docks the robot; -1 when not armed
+      required:
+        - armed
+        - remainingSec
+    MaintenanceData:
+      type: object
+      properties:
+        brushHours:
+          type: number
+          description: Hours of cleaning runtime since the main brush was last reset
+        filterHours:
+          type: number
+          description: Hours of cleaning runtime since the filter was last reset
+        sideBrushHours:
+          type: number
+          description: Hours of cleaning runtime since the side brush was last reset
+        sensorHours:
+          type: number
+          description: Hours of cleaning runtime since sensors were last cleaned/reset
+        brushIntervalHours:
+          type: number
+          description: Recommended replacement interval for the main brush, in hours (tunable default)
+        filterIntervalHours:
+          type: number
+          description: Recommended replacement interval for the filter, in hours (tunable default)
+        sideBrushIntervalHours:
+          type: number
+          description: Recommended replacement interval for the side brush, in hours (tunable default)
+        sensorIntervalHours:
+          type: number
+          description: Recommended cleaning interval for sensors, in hours (tunable default)
+      required:
+        - brushHours
+        - filterHours
+        - sideBrushHours
+        - sensorHours
+        - brushIntervalHours
+        - filterIntervalHours
+        - sideBrushIntervalHours
+        - sensorIntervalHours
   responses:
     Ok:
       description: Success acknowledgement

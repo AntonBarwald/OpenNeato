@@ -154,3 +154,10 @@ void NotificationManager::sendTestNotification(const String& topic) {
     const String& hostname = settings.get().hostname;
     sendNotification(topic, "bell", hostname, "Test notification");
 }
+
+void NotificationManager::notifyEvent(const String& tags, const String& title, const String& message) {
+    const Settings& cfg = settings.get();
+    if (!cfg.ntfyEnabled || cfg.ntfyTopic.isEmpty())
+        return;
+    sendNotification(cfg.ntfyTopic, tags, title, message);
+}

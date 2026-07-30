@@ -120,6 +120,8 @@ struct BatteryAnalogData : public JsonSerializable {
     int batteryCurrentMA = 0;
     float batteryTemperatureC = 0.0f;
     float externalVoltageV = 0.0f;
+    int dropSensorLeftMM = -1; // -1 = not present in response / not yet read
+    int dropSensorRightMM = -1;
 
     std::vector<Field> toFields() const override;
 };
@@ -180,6 +182,7 @@ struct ErrorData : public JsonSerializable {
     int errorCode = 200; // 200 = UI_ALERT_INVALID = no error
     String errorMessage; // Full raw response (for diagnostics/logging)
     String displayMessage; // Human-readable message for UI and notifications
+    String recoveryHint; // Short actionable next step, "" if none applies
 
     std::vector<Field> toFields() const override;
 };
@@ -225,10 +228,16 @@ struct UserSettingsData : public JsonSerializable {
     bool fromFields(const std::vector<Field>& fields) override;
 };
 
-// Robot position — hidden command, response format unknown.
-// Returns the raw response verbatim for inspection on real hardware.
+// Robot position — hidden command ("GetRobotPos Raw|Smooth"), reverse-engineered format
+// "... X=<f> Y=<f> Theta=<f> Time=<f> ...". x/y in robot-world meters, theta in degrees.
+// Shared by CleaningHistory and the navigation modules so both use one parser.
 struct RobotPosData : public JsonSerializable {
-    String raw; // Full raw response — parse once format is known
+    String raw; // Full raw response, trimmed (kept for diagnostics/logging)
+    float x = 0.0f; // meters
+    float y = 0.0f; // meters
+    float theta = 0.0f; // degrees
+    float time = 0.0f; // seconds, robot-relative clock
+    bool hasPose = false; // True if X/Y/Theta/Time were all present and parsed
 
     std::vector<Field> toFields() const override;
 };
@@ -244,7 +253,7 @@ bool parseMotorData(const String& raw, MotorData& out);
 bool parseRobotState(const String& raw, RobotState& out);
 bool parseErrorData(const String& raw, ErrorData& out);
 bool parseLdsScanData(const String& raw, LdsScanData& out);
-bool parseRobotPosData(const String& raw, RobotPosData& out);
+bool parseRobotPosData(const String& raw, RobotPosData& out, bool smooth);
 bool parseUserSettingsData(const String& raw, UserSettingsData& out);
 
 // -- Model support -----------------------------------------------------------

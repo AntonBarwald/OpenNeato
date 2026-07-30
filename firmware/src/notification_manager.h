@@ -18,6 +18,11 @@ public:
     // Send a test notification to the given topic (called from web server)
     void sendTestNotification(const String& topic);
 
+    // Ad-hoc notification for events the state-transition poller can't see (e.g. a scheduled
+    // action skipped before anything robot-state-visible happened). Respects ntfyEnabled;
+    // does not gate on ntfyOnDone/OnError/OnAlert/OnDocking.
+    void notifyEvent(const String& tags, const String& title, const String& message);
+
 private:
     void tick() override; // Called by LoopTask; skipped while fetchPending
 

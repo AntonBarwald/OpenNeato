@@ -7,11 +7,17 @@
 #include "config.h"
 #include "json_fields.h"
 
+// Stored as int (not bool) so a 4th mode can be added later without a key-shape migration.
+enum SchedMode { SCHED_MODE_HOUSE = 0, SCHED_MODE_SPOT = 1, SCHED_MODE_GUIDED = 2 };
+
 // Single schedule time slot
 struct SchedSlot {
     int hour = 0; // 0-23
     int minute = 0; // 0-59
-    bool on = false; // true = house clean at this time
+    bool on = false; // true = clean at this time
+    SchedMode mode = SCHED_MODE_HOUSE; // Default preserves today's house-only behavior
+    String guidedSession; // Session filename; only meaningful when mode == SCHED_MODE_GUIDED
+    String guidedZones; // Comma-joined zone LABELS (not indices); empty = whole house
 };
 
 // Per-day schedule (Mon=0 .. Sun=6), two slots per day
@@ -55,6 +61,9 @@ struct Settings : public JsonSerializable {
     // Schedule (ESP32-managed, not robot serial)
     bool scheduleEnabled = false;
     SchedDay sched[SCHEDULE_DAYS]; // Mon=0 .. Sun=6
+    // Unattended-run gate for scheduled guided cleans; configuring a slot is always allowed,
+    // this only gates FIRING one unattended.
+    bool guidedScheduleArmed = false;
 
     // Daily maintenance automation
     bool autoRestartEnabled = false;

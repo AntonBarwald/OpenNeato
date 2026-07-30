@@ -1,0 +1,34 @@
+import backSvg from "../assets/icons/back.svg?raw";
+import { ErrorBannerStack, useErrorStack } from "../components/error-banner";
+import { Icon } from "../components/icon";
+import { T, useI18n } from "../i18n";
+import { MaintenanceCard } from "./settings/maintenance-card";
+
+interface MaintenanceViewProps {
+    firmwareSupported: boolean;
+}
+
+export function MaintenanceView({ firmwareSupported }: MaintenanceViewProps) {
+    const { t } = useI18n();
+    const [errors, errorStack] = useErrorStack();
+
+    return (
+        <>
+            <div class="header">
+                <a href="#/settings" class="header-back-btn" aria-label={t("Back")}>
+                    <Icon svg={backSvg} />
+                </a>
+                <h1>
+                    <T>Maintenance</T>
+                </h1>
+                <div class="header-right-spacer" />
+            </div>
+
+            <ErrorBannerStack errors={errors} />
+
+            <div class="schedule-page">
+                <MaintenanceCard firmwareSupported={firmwareSupported} errorStack={errorStack} />
+            </div>
+        </>
+    );
+}

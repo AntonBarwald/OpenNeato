@@ -588,8 +588,14 @@ void DataLogger::onCommand(const String& cmd, CommandStatus status, unsigned lon
                                  {"ms", String(ms), FIELD_INT},
                                  {"q", String(queueDepth), FIELD_INT},
                                  {"bytes", String(respBytes), FIELD_INT}};
-    if (level >= LOG_LEVEL_DEBUG)
-        fields.push_back({"resp", raw, FIELD_STRING});
+    if (level >= LOG_LEVEL_DEBUG) {
+        // Cap the logged response — GetLDSScan can be 5451 bytes; unbounded String
+        // concatenation of that repeatedly fragments heap and crashes the ESP32.
+        static const size_t LOG_RESP_MAX_CHARS = 512;
+        String loggedResp =
+                raw.length() > LOG_RESP_MAX_CHARS ? raw.substring(0, LOG_RESP_MAX_CHARS) + "...(truncated)" : raw;
+        fields.push_back({"resp", loggedResp, FIELD_STRING});
+    }
     logEvent("command", fields);
 }
 

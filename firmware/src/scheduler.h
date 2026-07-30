@@ -11,6 +11,8 @@
 #include "neato_serial.h"
 
 class DataLogger;
+class NavigationManager;
+class NotificationManager;
 
 // ESP32-managed time-based automation.
 // Checks system time against the schedule stored in SettingsManager
@@ -19,7 +21,8 @@ class DataLogger;
 // Runs entirely on the ESP32 — does not use robot serial schedule commands.
 class Scheduler : public LoopTask {
 public:
-    Scheduler(SettingsManager& settings, SystemManager& system, NeatoSerial& serial, DataLogger& logger);
+    Scheduler(SettingsManager& settings, SystemManager& system, NeatoSerial& serial, DataLogger& logger,
+              NavigationManager& navMgr, NotificationManager& notifMgr);
 
 private:
     void tick() override; // Called every SCHEDULE_CHECK_INTERVAL_MS
@@ -27,6 +30,8 @@ private:
     SystemManager& system;
     NeatoSerial& serial;
     DataLogger& dataLogger;
+    NavigationManager& navMgr;
+    NotificationManager& notifMgr;
 
     // Duplicate trigger guard for cleaning slots per day.
     int firedDay = -1;
@@ -48,6 +53,12 @@ private:
     void handlePendingCleanAfterRestart();
     void clearPendingCleanAfterRestart();
     void triggerClean(int day, int slotIndex);
+    void triggerHouseClean(int day, int slotIndex, const SchedSlot& slot);
+    void triggerSpotClean(int day, int slotIndex, const SchedSlot& slot);
+    void triggerGuidedClean(int day, int slotIndex, const SchedSlot& slot);
+    // Fallback for every guided fire-time failure: log + best-effort ntfy + do nothing else.
+    // Never falls back to a house clean.
+    void logAndMaybeNotify(const char *eventName, int day, const String& slotStr, const String& message);
 
     // Returns true if the given time is within the check window and not already fired.
     // Writes the computed minutes-since-midnight into outSchedMins.

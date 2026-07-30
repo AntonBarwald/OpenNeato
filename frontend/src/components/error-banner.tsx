@@ -9,11 +9,12 @@ import { Icon } from "./icon";
 interface ErrorBannerProps {
     title?: string;
     message: string;
+    hint?: string;
     variant?: "error" | "warning";
     onDismiss?: () => void;
 }
 
-export function ErrorBanner({ title = "Alert", message, variant = "error", onDismiss }: ErrorBannerProps) {
+export function ErrorBanner({ title = "Alert", message, hint, variant = "error", onDismiss }: ErrorBannerProps) {
     const { t } = useI18n();
     const cls = variant === "warning" ? "error-banner warning" : "error-banner";
     return (
@@ -25,6 +26,7 @@ export function ErrorBanner({ title = "Alert", message, variant = "error", onDis
                 <div class="error-banner-content">
                     <div class="error-banner-title">{t(title)}</div>
                     <div class="error-banner-msg">{t(message)}</div>
+                    {hint && <div class="error-banner-hint">{t(hint)}</div>}
                 </div>
                 {onDismiss && (
                     <button type="button" class="error-banner-dismiss" onClick={onDismiss} aria-label={t("Dismiss")}>

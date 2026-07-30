@@ -18,12 +18,18 @@ class ManualCleanManager;
 class NotificationManager;
 class CleaningHistory;
 class WiFiManager;
+class ZonesManager;
+class NavigationPoc;
+class NavigationManager;
+class MaintenanceTracker;
+class WholeHouseTimer;
 
 class WebServer {
 public:
     WebServer(AsyncWebServer& server, NeatoSerial& neato, DataLogger& logger, SystemManager& sys, FirmwareManager& fw,
               SettingsManager& settings, ManualCleanManager& manual, NotificationManager& notif,
-              CleaningHistory& history, WiFiManager& wifi);
+              CleaningHistory& history, WiFiManager& wifi, ZonesManager& zones, NavigationPoc& navPoc,
+              NavigationManager& navMgr, MaintenanceTracker& maint, WholeHouseTimer& wholeHouseTimer);
     void begin();
 
     // Last time any API request was received (millis()). Any module can check
@@ -41,6 +47,11 @@ private:
     NotificationManager& notifMgr;
     CleaningHistory& historyMgr;
     WiFiManager& wifiMgr;
+    ZonesManager& zonesMgr;
+    NavigationPoc& navPoc;
+    NavigationManager& navMgr;
+    MaintenanceTracker& maintMgr;
+    WholeHouseTimer& wholeHouseTimer;
 
     void registerApiRoutes();
     void registerManualRoutes();
@@ -50,6 +61,8 @@ private:
     void registerFirmwareRoutes();
     void registerMapRoutes();
     void registerWiFiRoutes();
+    void registerNavigationRoutes();
+    void registerMaintenanceRoutes();
     static void sendGzipAsset(AsyncWebServerRequest *request, const uint8_t *data, size_t len, const char *contentType);
     static void sendError(AsyncWebServerRequest *request, int code, const String& msg);
     static void sendOk(AsyncWebServerRequest *request);
@@ -62,6 +75,10 @@ private:
     // Overload for routes with a body callback (e.g. PUT with JSON body)
     using BodyHandler = std::function<int(AsyncWebServerRequest *, uint8_t *data, size_t len)>;
     void loggedBodyRoute(const char *path, WebRequestMethodComposite httpMethod, BodyHandler handler);
+
+    // Invoke a BodyHandler with the complete assembled body and log the request.
+    // Called by loggedBodyRoute once the full (possibly multi-segment) body is in.
+    void runBodyHandler(AsyncWebServerRequest *request, const BodyHandler& handler, uint8_t *data, size_t len);
 
     // Register a GET endpoint. The method pointer type fully determines the arg
     // count and data type. Pass one param name per user arg; {} for no-arg methods.

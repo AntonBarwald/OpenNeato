@@ -10,3 +10,8 @@ frontend/src/types.generated.ts
 flash/openneato-flash
 release/
 dist/
+
+# --- private fork additions ---
+openneato-flash_Darwin_arm64
+openneato-flash_*
+.opencode/

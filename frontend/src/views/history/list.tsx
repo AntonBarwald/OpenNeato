@@ -3,6 +3,7 @@ import { api } from "../../api";
 import boltSvg from "../../assets/icons/bolt.svg?raw";
 import clockSvg from "../../assets/icons/clock.svg?raw";
 import downloadSvg from "../../assets/icons/download.svg?raw";
+import pinSvg from "../../assets/icons/pin.svg?raw";
 import trashSvg from "../../assets/icons/trash.svg?raw";
 import { ConfirmDialog } from "../../components/confirm-dialog";
 import { Icon } from "../../components/icon";
@@ -18,11 +19,23 @@ interface SessionCardProps {
     filename: string;
     index: number;
     active?: boolean;
+    pinned?: boolean;
     onSelect: (i: number) => void;
     onDelete: (i: number) => void;
+    onTogglePin: (i: number) => void;
 }
 
-function SessionCard({ session, summary, filename, index, active, onSelect, onDelete }: SessionCardProps) {
+function SessionCard({
+    session,
+    summary,
+    filename,
+    index,
+    active,
+    pinned,
+    onSelect,
+    onDelete,
+    onTogglePin,
+}: SessionCardProps) {
     const { t, formatDateTime, formatDuration, formatNumber } = useI18n();
     const info = modeInfo(session?.mode ?? "");
     return (
@@ -38,6 +51,11 @@ function SessionCard({ session, summary, filename, index, active, onSelect, onDe
                             {active && (
                                 <span class="history-running-badge">
                                     <T>Running</T>
+                                </span>
+                            )}
+                            {pinned && !active && (
+                                <span class="history-pinned-badge">
+                                    <T>Pinned</T>
                                 </span>
                             )}
                         </span>
@@ -71,6 +89,16 @@ function SessionCard({ session, summary, filename, index, active, onSelect, onDe
                 <span class="history-session-chevron">&rsaquo;</span>
             </button>
             {!active && (
+                <button
+                    type="button"
+                    class={`history-session-pin${pinned ? " on" : ""}`}
+                    onClick={() => onTogglePin(index)}
+                    aria-label={t(pinned ? "Unpin session" : "Pin session")}
+                >
+                    <Icon svg={pinSvg} />
+                </button>
+            )}
+            {!active && (
                 <a
                     class="history-session-download"
                     href={`/api/history/${filename}`}
@@ -103,6 +131,7 @@ interface HistoryListViewProps {
     onDeleteAll: () => void;
     onImported: () => void;
     onError: (msg: string) => void;
+    onTogglePin: (idx: number) => void;
 }
 
 type ImportStatus = "idle" | "uploading" | "done" | "error";
@@ -116,6 +145,7 @@ export function HistoryListView({
     onDeleteAll,
     onImported,
     onError,
+    onTogglePin,
 }: HistoryListViewProps) {
     const { t } = useI18n();
     const [confirmTarget, setConfirmTarget] = useState<string | null>(null);
@@ -234,6 +264,16 @@ export function HistoryListView({
                 </div>
             </div>
 
+            {files.length > 0 && !files.some((f) => f.pinned) && (
+                <div class="history-pin-hint">
+                    <Icon svg={pinSvg} />
+                    <T>
+                        Pin a finished session to use it as a Guided Clean reference — tap the pin icon on any card
+                        below.
+                    </T>
+                </div>
+            )}
+
             {files.length === 0 && (
                 <div class="history-empty">
                     <T>No cleaning history yet</T>
@@ -249,8 +289,10 @@ export function HistoryListView({
                     filename={f.name}
                     index={i}
                     active={f.recording}
+                    pinned={f.pinned}
                     onSelect={onSelect}
                     onDelete={() => setConfirmTarget(`session-${i}`)}
+                    onTogglePin={onTogglePin}
                 />
             ))}
 

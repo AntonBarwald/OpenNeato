@@ -6,129 +6,138 @@
 struct ErrorMessage {
     const char *token;
     const char *message;
+    const char *hint; // Short actionable recovery instruction, or "" if none applies
 };
 
 // Errors (UI_ERROR_*) - action required
 static const ErrorMessage ERROR_MESSAGES[] = {
-        {"UI_ERROR_CHECK_BATTERY_SWITCH", "Check the battery switch"},
-        {"UI_ERROR_DISCONNECT_CHRG_CABLE", "Disconnect the charging cable"},
-        {"UI_ERROR_DISCONNECT_USB_CABLE", "Disconnect the USB cable"},
-        {"UI_ERROR_SCHED_OFF", "Schedule is disabled"},
-        {"UI_ERROR_TIME_NOT_SET", "Clock is not set"},
-        {"UI_ERROR_DUST_BIN_EMPTIED", "Dust bin removed during cleaning"},
-        {"UI_ERROR_DUST_BIN_MISSING", "Dust bin is missing"},
-        {"UI_ERROR_DUST_BIN_FULL", "Dust bin is full"},
-        {"UI_ERROR_BATTERY_OVERTEMP", "Battery is too hot"},
-        {"UI_ERROR_UNABLE_TO_RETURN_TO_BASE", "Could not return to base"},
-        {"UI_ERROR_QA_FAIL", "Quality assurance test failed"},
-        {"UI_ERROR_BUMPER_STUCK", "Bumper is stuck"},
-        {"UI_ERROR_PICKED_UP", "Robot is picked up or tilted"},
-        {"UI_ERROR_RECONNECT_FAILED", "Failed to reconnect"},
-        {"UI_ERROR_LWHEEL_STUCK", "Left wheel is stuck"},
-        {"UI_ERROR_RWHEEL_STUCK", "Right wheel is stuck"},
-        {"UI_ERROR_LDS_JAMMED", "LIDAR turret is jammed"},
-        {"UI_ERROR_LDS_DISCONNECTED", "LIDAR is disconnected"},
-        {"UI_ERROR_LDS_MISSED_PACKETS", "LIDAR missed packets"},
-        {"UI_ERROR_LDS_BAD_PACKETS", "LIDAR bad packets"},
-        {"UI_ERROR_LDS_LASER_OVER_POWER", "LIDAR laser over power"},
-        {"UI_ERROR_LDS_LASER_UNDER_POWER", "LIDAR laser under power"},
-        {"UI_ERROR_BRUSH_STUCK", "Main brush is stuck"},
-        {"UI_ERROR_BRUSH_OVERLOAD", "Main brush is overloaded"},
-        {"UI_ERROR_VACUUM_STUCK", "Vacuum motor is stuck"},
-        {"UI_ERROR_VACUUM_SLIP", "Vacuum motor is slipping"},
-        {"UI_ERROR_BATTERY_CRITICAL", "Battery critically low"},
-        {"UI_ERROR_BATTERY_OverVolt", "Battery over-voltage"},
-        {"UI_ERROR_BATTERY_UnderVolt", "Battery under-voltage"},
-        {"UI_ERROR_BATTERY_UnderCurrent", "Battery under-current"},
-        {"UI_ERROR_BATTERY_Mismatch", "Battery mismatch detected"},
-        {"UI_ERROR_BATTERY_LithiumAdapterFailure", "Lithium battery adapter failure"},
-        {"UI_ERROR_BATTERY_UnderTemp", "Battery is too cold"},
-        {"UI_ERROR_BATTERY_Unplugged", "Battery is unplugged"},
-        {"UI_ERROR_BATTERY_NoThermistor", "Battery thermistor missing"},
-        {"UI_ERROR_BATTERY_BattUnderVoltLithiumSafety", "Battery under-voltage safety cutoff"},
-        {"UI_ERROR_BATTERY_InvalidSensor", "Battery sensor is invalid"},
-        {"UI_ERROR_BATTERY_PermanentError", "Permanent battery error"},
-        {"UI_ERROR_BATTERY_Fault", "Battery fault"},
-        {"UI_ERROR_NAVIGATION_UndockingFailed", "Failed to undock from base"},
-        {"UI_ERROR_NAVIGATION_Falling", "Robot detected a cliff"},
-        {"UI_ERROR_NAVIGATION_PinkyCommsFail", "Navigation sensor communication failure"},
-        {"UI_ERROR_NAVIGATION_NoMotionCommands", "No motion commands received"},
-        {"UI_ERROR_NAVIGATION_BackDrop_LeftBump", "Rear drop sensor triggered with left bump"},
-        {"UI_ERROR_NAVIGATION_BackDrop_FrontBump", "Rear drop sensor triggered with front bump"},
-        {"UI_ERROR_NAVIGATION_BackDrop_WheelExtended", "Rear drop sensor triggered with wheel extended"},
-        {"UI_ERROR_NAVIGATION_RightDrop_LeftBump", "Right drop sensor triggered with left bump"},
-        {"UI_ERROR_NAVIGATION_NoExitsToGo", "No exits available to continue"},
-        {"UI_ERROR_NAVIGATION_PathProblems_ReturningHome", "Path problems while returning home"},
-        {"UI_ERROR_NAVIGATION_NoProgress", "Robot is stuck"},
-        {"UI_ERROR_NAVIGATION_BadMagSensor", "Magnetic sensor error"},
-        {"UI_ERROR_NAVIGATION_Origin_Unclean", "Could not clean starting area"},
-        {"UI_ERROR_NAVIGATION_PathBlocked_GoingToZone", "Path to zone is blocked"},
-        {"UI_ERROR_SHUTDOWN", "Robot is shutting down"},
-        {"UI_ERROR_DFLT_APP", "Default application error"},
-        {"UI_ERROR_CORRUPT_SCB", "Corrupt system configuration"},
-        {"UI_ERROR_SCB_FLASH_READ", "System config flash read error"},
-        {"UI_ERROR_SCB_SIGNATURE", "System config signature error"},
-        {"UI_ERROR_SCB_LENGTH_MISMATCH", "System config length mismatch"},
-        {"UI_ERROR_SCB_CHECKSUM", "System config checksum error"},
-        {"UI_ERROR_SCB_VALIDATION", "System config validation error"},
-        {"UI_ERROR_SCB_INTERFACE", "System config interface error"},
-        {"UI_ERROR_HARDWARE_FAILURE", "Hardware failure"},
-        {"UI_ERROR_DECK_DEBRIS", "Clear debris from brush deck"},
-        {"UI_ERROR_RDROP_STUCK", "Right drop sensor is stuck"},
-        {"UI_ERROR_LDROP_STUCK", "Left drop sensor is stuck"},
-        {"UI_ERROR_UNABLE_TO_SEE", "Navigation sensors blocked"},
-        {"UI_ERROR_TILTED_ON_CLEANING_STARTUP", "Robot was tilted at cleaning start"},
-        {"UI_ERROR_SWUPDATE_FILEMISSING", "Firmware update file missing"},
-        {"UI_ERROR_FLIGHT_SENSOR_DISCONNECTED", "Floor sensor disconnected"},
-        {"UI_ERROR_WIFIPSWDORROUTERISSUE", "WiFi password or router issue"},
-        {"UI_ERROR_CONNECTINGTOSERVER", "Could not connect to server"},
-        {"UI_ERROR_TIMEDOUTCONNECTROUTER", "Timed out connecting to router"},
+        {"UI_ERROR_CHECK_BATTERY_SWITCH", "Check the battery switch", ""},
+        {"UI_ERROR_DISCONNECT_CHRG_CABLE", "Disconnect the charging cable", ""},
+        {"UI_ERROR_DISCONNECT_USB_CABLE", "Disconnect the USB cable", ""},
+        {"UI_ERROR_SCHED_OFF", "Schedule is disabled", ""},
+        {"UI_ERROR_TIME_NOT_SET", "Clock is not set", ""},
+        {"UI_ERROR_DUST_BIN_EMPTIED", "Dust bin removed during cleaning", "Reinsert the dust bin to resume"},
+        {"UI_ERROR_DUST_BIN_MISSING", "Dust bin is missing", "Reinsert the dust bin and press Start"},
+        {"UI_ERROR_DUST_BIN_FULL", "Dust bin is full", "Empty the dust bin and press Start"},
+        {"UI_ERROR_BATTERY_OVERTEMP", "Battery is too hot", "Let the robot cool down before resuming"},
+        {"UI_ERROR_UNABLE_TO_RETURN_TO_BASE", "Could not return to base",
+         "Move the dock to an open area and clear the path to it"},
+        {"UI_ERROR_QA_FAIL", "Quality assurance test failed", ""},
+        {"UI_ERROR_BUMPER_STUCK", "Bumper is stuck", "Check the bumper for obstructions and tap it to free it"},
+        {"UI_ERROR_PICKED_UP", "Robot is picked up or tilted", "Place the robot back on a flat floor"},
+        {"UI_ERROR_RECONNECT_FAILED", "Failed to reconnect", ""},
+        {"UI_ERROR_LWHEEL_STUCK", "Left wheel is stuck", "Check the left wheel for hair or debris"},
+        {"UI_ERROR_RWHEEL_STUCK", "Right wheel is stuck", "Check the right wheel for hair or debris"},
+        {"UI_ERROR_LDS_JAMMED", "LIDAR turret is jammed",
+         "Remove any obstruction from the spinning LIDAR turret on top"},
+        {"UI_ERROR_LDS_DISCONNECTED", "LIDAR is disconnected",
+         "Power-cycle the robot; contact support if this persists"},
+        {"UI_ERROR_LDS_MISSED_PACKETS", "LIDAR missed packets", ""},
+        {"UI_ERROR_LDS_BAD_PACKETS", "LIDAR bad packets", ""},
+        {"UI_ERROR_LDS_LASER_OVER_POWER", "LIDAR laser over power", ""},
+        {"UI_ERROR_LDS_LASER_UNDER_POWER", "LIDAR laser under power", ""},
+        {"UI_ERROR_BRUSH_STUCK", "Main brush is stuck", "Remove hair or debris tangled in the main brush"},
+        {"UI_ERROR_BRUSH_OVERLOAD", "Main brush is overloaded", "Clear debris from the brush and brush deck"},
+        {"UI_ERROR_VACUUM_STUCK", "Vacuum motor is stuck", "Check the vacuum path for a clog"},
+        {"UI_ERROR_VACUUM_SLIP", "Vacuum motor is slipping", ""},
+        {"UI_ERROR_BATTERY_CRITICAL", "Battery critically low", "Return the robot to its dock to recharge"},
+        {"UI_ERROR_BATTERY_OverVolt", "Battery over-voltage", ""},
+        {"UI_ERROR_BATTERY_UnderVolt", "Battery under-voltage", ""},
+        {"UI_ERROR_BATTERY_UnderCurrent", "Battery under-current", ""},
+        {"UI_ERROR_BATTERY_Mismatch", "Battery mismatch detected", ""},
+        {"UI_ERROR_BATTERY_LithiumAdapterFailure", "Lithium battery adapter failure", ""},
+        {"UI_ERROR_BATTERY_UnderTemp", "Battery is too cold", ""},
+        {"UI_ERROR_BATTERY_Unplugged", "Battery is unplugged", "Check the battery connector is seated"},
+        {"UI_ERROR_BATTERY_NoThermistor", "Battery thermistor missing", ""},
+        {"UI_ERROR_BATTERY_BattUnderVoltLithiumSafety", "Battery under-voltage safety cutoff", ""},
+        {"UI_ERROR_BATTERY_InvalidSensor", "Battery sensor is invalid", ""},
+        {"UI_ERROR_BATTERY_PermanentError", "Permanent battery error", ""},
+        {"UI_ERROR_BATTERY_Fault", "Battery fault", ""},
+        {"UI_ERROR_NAVIGATION_UndockingFailed", "Failed to undock from base", ""},
+        {"UI_ERROR_NAVIGATION_Falling", "Robot detected a cliff",
+         "Move the robot away from stairs or ledges and restart cleaning"},
+        {"UI_ERROR_NAVIGATION_PinkyCommsFail", "Navigation sensor communication failure", ""},
+        {"UI_ERROR_NAVIGATION_NoMotionCommands", "No motion commands received", ""},
+        {"UI_ERROR_NAVIGATION_BackDrop_LeftBump", "Rear drop sensor triggered with left bump", ""},
+        {"UI_ERROR_NAVIGATION_BackDrop_FrontBump", "Rear drop sensor triggered with front bump", ""},
+        {"UI_ERROR_NAVIGATION_BackDrop_WheelExtended", "Rear drop sensor triggered with wheel extended", ""},
+        {"UI_ERROR_NAVIGATION_RightDrop_LeftBump", "Right drop sensor triggered with left bump", ""},
+        {"UI_ERROR_NAVIGATION_NoExitsToGo", "No exits available to continue", ""},
+        {"UI_ERROR_NAVIGATION_PathProblems_ReturningHome", "Path problems while returning home", ""},
+        {"UI_ERROR_NAVIGATION_NoProgress", "Robot is stuck", "Move the robot to open floor and press Start"},
+        {"UI_ERROR_NAVIGATION_BadMagSensor", "Magnetic sensor error", ""},
+        {"UI_ERROR_NAVIGATION_Origin_Unclean", "Could not clean starting area", ""},
+        {"UI_ERROR_NAVIGATION_PathBlocked_GoingToZone", "Path to zone is blocked", ""},
+        {"UI_ERROR_SHUTDOWN", "Robot is shutting down", ""},
+        {"UI_ERROR_DFLT_APP", "Default application error", ""},
+        {"UI_ERROR_CORRUPT_SCB", "Corrupt system configuration", ""},
+        {"UI_ERROR_SCB_FLASH_READ", "System config flash read error", ""},
+        {"UI_ERROR_SCB_SIGNATURE", "System config signature error", ""},
+        {"UI_ERROR_SCB_LENGTH_MISMATCH", "System config length mismatch", ""},
+        {"UI_ERROR_SCB_CHECKSUM", "System config checksum error", ""},
+        {"UI_ERROR_SCB_VALIDATION", "System config validation error", ""},
+        {"UI_ERROR_SCB_INTERFACE", "System config interface error", ""},
+        {"UI_ERROR_HARDWARE_FAILURE", "Hardware failure", ""},
+        {"UI_ERROR_DECK_DEBRIS", "Clear debris from brush deck", "Remove debris from the brush deck"},
+        {"UI_ERROR_RDROP_STUCK", "Right drop sensor is stuck", "Wipe the right cliff sensor with a dry cloth"},
+        {"UI_ERROR_LDROP_STUCK", "Left drop sensor is stuck", "Wipe the left cliff sensor with a dry cloth"},
+        {"UI_ERROR_UNABLE_TO_SEE", "Navigation sensors blocked",
+         "Wipe the LIDAR window and cliff sensors with a dry cloth"},
+        {"UI_ERROR_TILTED_ON_CLEANING_STARTUP", "Robot was tilted at cleaning start",
+         "Place the robot flat on the floor and press Start"},
+        {"UI_ERROR_SWUPDATE_FILEMISSING", "Firmware update file missing", ""},
+        {"UI_ERROR_FLIGHT_SENSOR_DISCONNECTED", "Floor sensor disconnected", ""},
+        {"UI_ERROR_WIFIPSWDORROUTERISSUE", "WiFi password or router issue", ""},
+        {"UI_ERROR_CONNECTINGTOSERVER", "Could not connect to server", ""},
+        {"UI_ERROR_TIMEDOUTCONNECTROUTER", "Timed out connecting to router", ""},
 };
 
 // Alerts (UI_ALERT_*) - informational
 static const ErrorMessage ALERT_MESSAGES[] = {
-        {"UI_ALERT_RETURN_TO_BASE_PWR", "Returning to base (low power)"},
-        {"UI_ALERT_RETURN_TO_BASE", "Returning to base"},
-        {"UI_ALERT_RETURN_TO_START", "Returning to start"},
-        {"UI_ALERT_RETURN_TO_CHARGE", "Returning to charge"},
-        {"UI_ALERT_DUST_BIN_FULL", "Dust bin full"},
-        {"UI_ALERT_BUSY_CHARGING", "Busy charging"},
-        {"UI_ALERT_OLD_ERROR", "Previous error cleared"},
-        {"UI_ALERT_RECOVERING_LOCATION", "Recovering location"},
-        {"UI_ALERT_INFO_THANK_YOU", "Cleaning complete"},
-        {"UI_ALERT_LOG_READ_FAIL", "Failed to read log"},
-        {"UI_ALERT_LOG_WRITE_FAIL", "Failed to write log"},
-        {"UI_ALERT_USB_DISCONNECTED", "USB disconnected"},
-        {"UI_ALERT_SWUPDATE_SUCCESS", "Firmware update successful"},
-        {"UI_ALERT_SWUPDATE_FAIL", "Firmware update failed"},
-        {"UI_ALERT_LOG_WRITE_SUCCESS", "Log saved successfully"},
-        {"UI_ALERT_TIME_NOT_SET", "Clock is not set"},
-        {"UI_ALERT_TIME_SET", "Clock has been set"},
-        {"UI_ALERT_TIMER_SET", "Schedule timer set"},
-        {"UI_ALERT_TIMER_REMOVED", "Schedule timer removed"},
-        {"UI_ALERT_ENABLE_TIMER", "Schedule timer enabled"},
-        {"UI_ALERT_CHARGING_POWER", "Charging via power adapter"},
-        {"UI_ALERT_CHARGING_BASE", "Charging on base"},
-        {"UI_ALERT_BATTERY_ChargeBaseCommErr", "Charge base communication error"},
-        {"UI_ALERT_CONNECT_CHRG_CABLE", "Connect charging cable"},
-        {"UI_ALERT_WAIT_FOR_POWER_SWITCH_DETECT", "Waiting for power switch"},
-        {"UI_ALERT_LINKEDAPP", "App linked"},
-        {"UI_ALERT_ORIGIN_UNCLEAN", "Could not clean starting area"},
-        {"UI_ALERT_LOGUPLOAD_FAIL", "Log upload failed"},
-        {"UI_ALERT_BRUSH_CHANGE", "Time to replace the brush"},
-        {"UI_ALERT_FILTER_CHANGE", "Time to replace the filter"},
-        {"UI_ALERT_PERSISTENT_RELOCALIZATION_FAIL", "Failed to relocalize on saved map"},
-        {"UI_ALERT_TRAINING_MULTIPLE_FLOORPLANS_VALID", "Multiple floor plans found during training"},
-        {"UI_ALERT_MULTIPLE_FLOORPLANS_VALID", "Multiple floor plans detected"},
-        {"UI_ALERT_PM_LOAD_FAIL", "Failed to load persistent map"},
-        {"UI_ALERT_PM_SETUP_FAIL", "Failed to set up persistent map"},
-        {"UI_ALERT_ACQUIRING_PERSISTENT_MAP_IDS", "Acquiring map data"},
-        {"UI_ALERT_CREATING_AND_UPLOADING_MAP", "Creating and saving map"},
-        {"UI_ALERT_PM_START_CLEAN_FAIL", "Failed to start cleaning with map"},
-        {"UI_ALERT_NAV_FLOORPLAN_NOT_CREATED", "Floor plan not yet created"},
-        {"UI_ALERT_NAV_FLOORPLAN_ZONE_UNREACHABLE", "Zone is unreachable"},
-        {"UI_ALERT_NAV_FLOORPLAN_ZONE_WRONG_FLOOR", "Zone is on a different floor"},
-        {"UI_ALERT_TRAINING_MAP_SPARSE", "Training map is too sparse"},
+        {"UI_ALERT_RETURN_TO_BASE_PWR", "Returning to base (low power)", ""},
+        {"UI_ALERT_RETURN_TO_BASE", "Returning to base", ""},
+        {"UI_ALERT_RETURN_TO_START", "Returning to start", ""},
+        {"UI_ALERT_RETURN_TO_CHARGE", "Returning to charge", ""},
+        {"UI_ALERT_DUST_BIN_FULL", "Dust bin full", "Empty the dust bin"},
+        {"UI_ALERT_BUSY_CHARGING", "Busy charging", ""},
+        {"UI_ALERT_OLD_ERROR", "Previous error cleared", ""},
+        {"UI_ALERT_RECOVERING_LOCATION", "Recovering location", ""},
+        {"UI_ALERT_INFO_THANK_YOU", "Cleaning complete", ""},
+        {"UI_ALERT_LOG_READ_FAIL", "Failed to read log", ""},
+        {"UI_ALERT_LOG_WRITE_FAIL", "Failed to write log", ""},
+        {"UI_ALERT_USB_DISCONNECTED", "USB disconnected", ""},
+        {"UI_ALERT_SWUPDATE_SUCCESS", "Firmware update successful", ""},
+        {"UI_ALERT_SWUPDATE_FAIL", "Firmware update failed", ""},
+        {"UI_ALERT_LOG_WRITE_SUCCESS", "Log saved successfully", ""},
+        {"UI_ALERT_TIME_NOT_SET", "Clock is not set", ""},
+        {"UI_ALERT_TIME_SET", "Clock has been set", ""},
+        {"UI_ALERT_TIMER_SET", "Schedule timer set", ""},
+        {"UI_ALERT_TIMER_REMOVED", "Schedule timer removed", ""},
+        {"UI_ALERT_ENABLE_TIMER", "Schedule timer enabled", ""},
+        {"UI_ALERT_CHARGING_POWER", "Charging via power adapter", ""},
+        {"UI_ALERT_CHARGING_BASE", "Charging on base", ""},
+        {"UI_ALERT_BATTERY_ChargeBaseCommErr", "Charge base communication error", ""},
+        {"UI_ALERT_CONNECT_CHRG_CABLE", "Connect charging cable", ""},
+        {"UI_ALERT_WAIT_FOR_POWER_SWITCH_DETECT", "Waiting for power switch", ""},
+        {"UI_ALERT_LINKEDAPP", "App linked", ""},
+        {"UI_ALERT_ORIGIN_UNCLEAN", "Could not clean starting area", ""},
+        {"UI_ALERT_LOGUPLOAD_FAIL", "Log upload failed", ""},
+        {"UI_ALERT_BRUSH_CHANGE", "Time to replace the brush",
+         "Replace the main brush (also tracked on the Maintenance page)"},
+        {"UI_ALERT_FILTER_CHANGE", "Time to replace the filter",
+         "Replace the filter (also tracked on the Maintenance page)"},
+        {"UI_ALERT_PERSISTENT_RELOCALIZATION_FAIL", "Failed to relocalize on saved map", ""},
+        {"UI_ALERT_TRAINING_MULTIPLE_FLOORPLANS_VALID", "Multiple floor plans found during training", ""},
+        {"UI_ALERT_MULTIPLE_FLOORPLANS_VALID", "Multiple floor plans detected", ""},
+        {"UI_ALERT_PM_LOAD_FAIL", "Failed to load persistent map", ""},
+        {"UI_ALERT_PM_SETUP_FAIL", "Failed to set up persistent map", ""},
+        {"UI_ALERT_ACQUIRING_PERSISTENT_MAP_IDS", "Acquiring map data", ""},
+        {"UI_ALERT_CREATING_AND_UPLOADING_MAP", "Creating and saving map", ""},
+        {"UI_ALERT_PM_START_CLEAN_FAIL", "Failed to start cleaning with map", ""},
+        {"UI_ALERT_NAV_FLOORPLAN_NOT_CREATED", "Floor plan not yet created", ""},
+        {"UI_ALERT_NAV_FLOORPLAN_ZONE_UNREACHABLE", "Zone is unreachable", ""},
+        {"UI_ALERT_NAV_FLOORPLAN_ZONE_WRONG_FLOOR", "Zone is on a different floor", ""},
+        {"UI_ALERT_TRAINING_MAP_SPARSE", "Training map is too sparse", ""},
 };
 
 // Look up a human-readable message for a UI_ERROR_* or UI_ALERT_* token.
@@ -143,6 +152,21 @@ static String lookupDisplayMessage(const String& raw) {
     for (const auto& entry: ALERT_MESSAGES) {
         if (raw.indexOf(entry.token) >= 0)
             return entry.message;
+    }
+    return "";
+}
+
+// Look up a short actionable recovery hint for a UI_ERROR_* or UI_ALERT_*
+// token. Returns empty string if not found or if the entry has no hint
+// (internal/informational codes that aren't user-actionable).
+static String lookupRecoveryHint(const String& raw) {
+    for (const auto& entry: ERROR_MESSAGES) {
+        if (raw.indexOf(entry.token) >= 0)
+            return entry.hint;
+    }
+    for (const auto& entry: ALERT_MESSAGES) {
+        if (raw.indexOf(entry.token) >= 0)
+            return entry.hint;
     }
     return "";
 }
@@ -226,6 +250,8 @@ std::vector<Field> BatteryAnalogData::toFields() const {
             {"batteryCurrentMA", String(batteryCurrentMA), FIELD_INT},
             {"batteryTemperatureC", String(batteryTemperatureC, 2), FIELD_FLOAT},
             {"externalVoltageV", String(externalVoltageV, 3), FIELD_FLOAT},
+            {"dropSensorLeftMM", String(dropSensorLeftMM), FIELD_INT},
+            {"dropSensorRightMM", String(dropSensorRightMM), FIELD_INT},
     };
 }
 
@@ -282,7 +308,7 @@ std::vector<Field> ErrorData::toFields() const {
     return {
             {"hasError", hasError ? "true" : "false", FIELD_BOOL}, {"kind", kind, FIELD_STRING},
             {"errorCode", String(errorCode), FIELD_INT},           {"errorMessage", errorMessage, FIELD_STRING},
-            {"displayMessage", displayMessage, FIELD_STRING},
+            {"displayMessage", displayMessage, FIELD_STRING},      {"recoveryHint", recoveryHint, FIELD_STRING},
     };
 }
 
@@ -438,6 +464,14 @@ bool parseBatteryAnalogData(const String& raw, BatteryAnalogData& out) {
     }
     if (findCsvValue(raw, "ExternalVoltage", val)) {
         out.externalVoltageV = csvLastField(val).toFloat() / 1000.0f;
+        found = true;
+    }
+    if (findCsvValue(raw, "DropSensorLeft", val)) {
+        out.dropSensorLeftMM = csvLastField(val).toInt();
+        found = true;
+    }
+    if (findCsvValue(raw, "DropSensorRight", val)) {
+        out.dropSensorRightMM = csvLastField(val).toInt();
         found = true;
     }
     return found;
@@ -625,6 +659,7 @@ bool parseErrorData(const String& raw, ErrorData& out) {
                 if (out.displayMessage.isEmpty()) {
                     out.displayMessage = "Robot reported error " + String(code);
                 }
+                out.recoveryHint = lookupRecoveryHint(trimmed);
                 return true;
             }
         }
@@ -839,13 +874,43 @@ bool parseUserSettingsData(const String& raw, UserSettingsData& out) {
 std::vector<Field> RobotPosData::toFields() const {
     return {
             {"raw", raw, FIELD_STRING},
+            {"x", String(x, 3), FIELD_FLOAT},
+            {"y", String(y, 3), FIELD_FLOAT},
+            {"theta", String(theta, 1), FIELD_FLOAT},
+            {"time", String(time, 1), FIELD_FLOAT},
+            {"hasPose", hasPose ? "true" : "false", FIELD_BOOL},
     };
 }
 
-bool parseRobotPosData(const String& raw, RobotPosData& out) {
-    // Response format unknown — just capture the raw response verbatim.
+bool parseRobotPosData(const String& raw, RobotPosData& out, bool smooth) {
     out.raw = raw;
     out.raw.trim();
+
+    // Reverse-engineered format: "... X=<f> Y=<f> Theta=<f> Time=<f> ...".
+    // Field order/surrounding text isn't guaranteed, so scan for each token independently.
+    int xPos = out.raw.indexOf("X=");
+    int yPos = out.raw.indexOf("Y=");
+    int tPos = out.raw.indexOf("Theta=");
+    int tmPos = out.raw.indexOf("Time=");
+    if (xPos >= 0 && yPos >= 0 && tPos >= 0 && tmPos >= 0) {
+        out.x = out.raw.substring(xPos + 2).toFloat();
+        out.y = out.raw.substring(yPos + 2).toFloat();
+        out.theta = out.raw.substring(tPos + 6).toFloat();
+        out.time = out.raw.substring(tmPos + 5).toFloat();
+
+        // Smooth resets to literal (0,0,0) on map-destroying events (e.g. `Clean Stop`) and a
+        // real fix essentially never lands on all three axes at exactly zero, so treat
+        // exact-zero as "no fix" there. Raw zeroes on every TestMode entry instead — (0,0,0)
+        // is its legitimate starting pose, so the sentinel doesn't apply to it.
+        bool isZeroSentinel = smooth && (out.x == 0.0f && out.y == 0.0f && out.theta == 0.0f);
+        out.hasPose = !isZeroSentinel;
+        if (isZeroSentinel) {
+            LOG("NEATO", "GetRobotPos Smooth: rejected zero-pose sentinel (raw=\"%s\")", out.raw.c_str());
+        }
+    } else {
+        out.hasPose = false;
+    }
+
     return out.raw.length() > 0;
 }
 

@@ -1,8 +1,13 @@
 #include "scheduler.h"
 #include "data_logger.h"
+#include "navigation_manager.h"
+#include "notification_manager.h"
+#include "zone_label_match.h"
 
-Scheduler::Scheduler(SettingsManager& settings, SystemManager& system, NeatoSerial& serial, DataLogger& logger) :
-    LoopTask(SCHEDULE_CHECK_INTERVAL_MS), settings(settings), system(system), serial(serial), dataLogger(logger) {
+Scheduler::Scheduler(SettingsManager& settings, SystemManager& system, NeatoSerial& serial, DataLogger& logger,
+                     NavigationManager& navMgr, NotificationManager& notifMgr) :
+    LoopTask(SCHEDULE_CHECK_INTERVAL_MS), settings(settings), system(system), serial(serial), dataLogger(logger),
+    navMgr(navMgr), notifMgr(notifMgr) {
     TaskRegistry::add(this);
 }
 
@@ -71,6 +76,8 @@ bool Scheduler::handleScheduledCleaning(const Settings& s, int day, int nowMins)
                 return;
             }
 
+            // No docked check here even for guided slots — that runs post-restart in
+            // triggerGuidedClean() instead of on every check-interval tick.
             if (restartFirst) {
                 LOG("SCHED", "Restarting robot before scheduled clean (day=%d slot=%d %s)", day, si, slotStr.c_str());
                 dataLogger.logGenericEvent("scheduler_restart_before_clean",
@@ -92,6 +99,8 @@ bool Scheduler::handleScheduledCleaning(const Settings& s, int day, int nowMins)
                 triggerClean(day, si);
             }
 
+            // Marked fired even if powerControl("restart") failed above (that branch only
+            // logs and returns) — avoids retry-storming a broken restart every tick.
             firedSlots[si] = schedMins;
         });
         return true;
@@ -146,15 +155,113 @@ void Scheduler::triggerClean(int day, int slotIndex) {
         return;
     }
 
-    LOG("SCHED", "Triggering clean (day=%d slot=%d %s)", day, slotIndex, slotStr.c_str());
+    // Also the pending-clean-after-restart resume path — no separate bookkeeping needed.
+    switch (slot.mode) {
+        case SCHED_MODE_HOUSE:
+            triggerHouseClean(day, slotIndex, slot);
+            return;
+        case SCHED_MODE_SPOT:
+            triggerSpotClean(day, slotIndex, slot);
+            return;
+        case SCHED_MODE_GUIDED:
+            triggerGuidedClean(day, slotIndex, slot);
+            return;
+        default:
+            LOG("SCHED", "Unknown schedule mode %d, skipping (day=%d slot=%d)", static_cast<int>(slot.mode), day,
+                slotIndex);
+            return;
+    }
+}
+
+void Scheduler::triggerHouseClean(int day, int slotIndex, const SchedSlot& slot) {
+    String slotStr = String(slot.hour) + ":" + (slot.minute < 10 ? "0" : "") + String(slot.minute);
+
+    LOG("SCHED", "Triggering house clean (day=%d slot=%d %s)", day, slotIndex, slotStr.c_str());
     dataLogger.logGenericEvent("scheduler_trigger", {{"day", String(day), FIELD_INT}, {"slot", slotStr, FIELD_STRING}});
 
-    serial.clean("house", [this, day, slotStr](bool ok) {
+    serial.clean("house", 0, 0, [this, day, slotStr](bool ok) {
         LOG("SCHED", "Clean %s", ok ? "started" : "FAILED");
         if (!ok) {
             dataLogger.logGenericEvent("scheduler_trigger_failed",
                                        {{"day", String(day), FIELD_INT}, {"slot", slotStr, FIELD_STRING}});
         }
+    });
+}
+
+void Scheduler::triggerSpotClean(int day, int slotIndex, const SchedSlot& slot) {
+    String slotStr = String(slot.hour) + ":" + (slot.minute < 10 ? "0" : "") + String(slot.minute);
+
+    LOG("SCHED", "Triggering spot clean (day=%d slot=%d %s)", day, slotIndex, slotStr.c_str());
+    dataLogger.logGenericEvent("scheduler_spot_trigger",
+                               {{"day", String(day), FIELD_INT}, {"slot", slotStr, FIELD_STRING}});
+
+    serial.clean("spot", 0, 0, [this, day, slotStr](bool ok) {
+        LOG("SCHED", "Spot clean %s", ok ? "started" : "FAILED");
+        if (!ok) {
+            dataLogger.logGenericEvent("scheduler_spot_trigger_failed",
+                                       {{"day", String(day), FIELD_INT}, {"slot", slotStr, FIELD_STRING}});
+        }
+    });
+}
+
+void Scheduler::logAndMaybeNotify(const char *eventName, int day, const String& slotStr, const String& message) {
+    LOG("SCHED", "%s", message.c_str());
+    dataLogger.logGenericEvent(
+            eventName,
+            {{"day", String(day), FIELD_INT}, {"slot", slotStr, FIELD_STRING}, {"message", message, FIELD_STRING}});
+    notifMgr.notifyEvent("warning", "Scheduled guided clean skipped", message);
+}
+
+// Reuses the same validation/start path as the interactive POST /api/guided route
+// (navMgr.start()). isRobotIdle()/busy is already checked by handleScheduledCleaning()
+// before triggerClean() is called, for all three modes — not duplicated here.
+void Scheduler::triggerGuidedClean(int day, int slotIndex, const SchedSlot& slot) {
+    String slotStr = String(slot.hour) + ":" + (slot.minute < 10 ? "0" : "") + String(slot.minute);
+
+    if (!settings.get().guidedScheduleArmed) {
+        logAndMaybeNotify("scheduler_guided_gate_off", day, slotStr,
+                          "Scheduled guided clean skipped: unattended guided cleans are not enabled "
+                          "(Settings > Schedule > 'Allow unattended guided cleans')");
+        return;
+    }
+    if (slot.guidedSession.isEmpty()) {
+        logAndMaybeNotify("scheduler_guided_no_session", day, slotStr,
+                          "Scheduled guided clean skipped: no reference session configured");
+        return;
+    }
+
+    // Docked + battery-floor preconditions, read from one GetCharger round-trip — not implied
+    // by handleScheduledCleaning()'s isRobotIdle() check.
+    serial.getCharger([this, day, slotIndex, slotStr, slot](bool ok, const ChargerData& c) {
+        if (!ok) {
+            logAndMaybeNotify("scheduler_guided_charger_error", day, slotStr,
+                              "Scheduled guided clean skipped: could not read robot battery/dock state");
+            return;
+        }
+        if (!c.extPwrPresent) {
+            logAndMaybeNotify("scheduler_guided_not_docked", day, slotStr,
+                              "Scheduled guided clean skipped: robot is not docked");
+            return;
+        }
+        if (c.fuelPercent >= 0 && c.fuelPercent < NAV_MGR_SCHED_MIN_START_BATTERY_PCT) {
+            logAndMaybeNotify("scheduler_guided_low_battery", day, slotStr,
+                              "Scheduled guided clean skipped: battery too low to start scheduled guided clean, "
+                              "will retry next scheduled time");
+            return;
+        }
+
+        String error;
+        if (!navMgr.start(slot.guidedSession, splitZoneLabels(slot.guidedZones), error)) {
+            logAndMaybeNotify("scheduler_guided_start_failed", day, slotStr,
+                              String("Scheduled guided clean skipped: ") + error);
+            return;
+        }
+
+        LOG("SCHED", "Triggering guided clean (day=%d slot=%d %s session=%s)", day, slotIndex, slotStr.c_str(),
+            slot.guidedSession.c_str());
+        dataLogger.logGenericEvent("scheduler_guided_trigger", {{"day", String(day), FIELD_INT},
+                                                                {"slot", slotStr, FIELD_STRING},
+                                                                {"session", slot.guidedSession, FIELD_STRING}});
     });
 }
 

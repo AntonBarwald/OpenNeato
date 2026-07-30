@@ -1,5 +1,7 @@
 #include "neato_serial.h"
 #include "config.h"
+#include "spot_size.h"
+#include "spot_verify.h"
 
 // -- Lifecycle ---------------------------------------------------------------
 
@@ -39,11 +41,11 @@ NeatoSerial::NeatoSerial() :
             CACHE_HIT(CMD_GET_LDS_SCAN)),
     robotPosRawCache(
             CACHE_TTL_SENSORS,
-            [this](AsyncCache<RobotPosData>::Callback cb) { fetchRobotPos(CMD_GET_ROBOT_POS_RAW, cb); },
+            [this](AsyncCache<RobotPosData>::Callback cb) { fetchRobotPos(CMD_GET_ROBOT_POS_RAW, false, cb); },
             CACHE_HIT(CMD_GET_ROBOT_POS_RAW)),
     robotPosSmoothCache(
             CACHE_TTL_SENSORS,
-            [this](AsyncCache<RobotPosData>::Callback cb) { fetchRobotPos(CMD_GET_ROBOT_POS_SMOOTH, cb); },
+            [this](AsyncCache<RobotPosData>::Callback cb) { fetchRobotPos(CMD_GET_ROBOT_POS_SMOOTH, true, cb); },
             CACHE_HIT(CMD_GET_ROBOT_POS_SMOOTH)),
     userSettingsCache(
             CACHE_TTL_VERSION, [this](AsyncCache<UserSettingsData>::Callback cb) { fetchUserSettings(cb); },
@@ -94,6 +96,13 @@ void NeatoSerial::tick() {
     if (sKeyPending && millis() >= sKeyRetryAt) {
         sKeyRetryAt = ULONG_MAX; // Prevent re-entry while fetch is in flight
         initSKey();
+    }
+
+    // Wraparound-safe: same unsigned-subtraction idiom as clean_timer_policy.h/Ticker::elapsed(),
+    // not a raw comparison against a precomputed absolute deadline.
+    if (spotVerifyPending && (millis() - spotVerifyArmedAt) >= spotVerifyDelayMs) {
+        spotVerifyPending = false;
+        checkSpotVerification();
     }
 
     switch (state) {
@@ -307,6 +316,19 @@ void NeatoSerial::getBatteryAnalog(std::function<void(bool, const BatteryAnalogD
     analogCache.get(callback);
 }
 
+void NeatoSerial::getBatteryAnalogHighPriority(std::function<void(bool, const BatteryAnalogData&)> callback) {
+    enqueue(
+            CMD_GET_ANALOG_SENSORS,
+            [callback](bool ok, const String& raw) {
+                BatteryAnalogData data;
+                if (ok)
+                    ok = parseBatteryAnalogData(raw, data);
+                if (callback)
+                    callback(ok, data);
+            },
+            PRIORITY_HIGH);
+}
+
 void NeatoSerial::getBatteryWarranty(std::function<void(bool, const BatteryWarrantyData&)> callback) {
     warrantyCache.get(callback);
 }
@@ -365,7 +387,30 @@ void NeatoSerial::getState(std::function<void(bool, const RobotState&)> callback
 }
 
 void NeatoSerial::getErr(std::function<void(bool, const ErrorData&)> callback) {
-    errCache.get(callback);
+    // Surface the spot-start safety-net notice through the same /api/error the dashboard
+    // already polls — but never mask a genuine robot-reported error/warning with it.
+    if (!spotStartMismatch) {
+        errCache.get(callback);
+        return;
+    }
+    errCache.get([callback](bool ok, const ErrorData& data) {
+        if (!ok || !callback) {
+            if (callback)
+                callback(ok, data);
+            return;
+        }
+        if (data.hasError) {
+            callback(true, data);
+            return;
+        }
+        ErrorData patched = data;
+        patched.hasError = true;
+        patched.kind = "warning";
+        patched.errorCode = 901; // Software-detected, not a robot GetErr code
+        patched.displayMessage = "Spot clean started a house clean instead — check the robot";
+        patched.recoveryHint = "Press Home to stop it, then retry the spot clean";
+        callback(true, patched);
+    });
 }
 
 void NeatoSerial::getErrClear(std::function<void(bool, const ErrorData&)> callback) {
@@ -490,11 +535,11 @@ void NeatoSerial::fetchLdsScan(std::function<void(bool, const LdsScanData&)> cal
     });
 }
 
-void NeatoSerial::fetchRobotPos(const char *cmd, std::function<void(bool, const RobotPosData&)> callback) {
-    enqueue(cmd, [callback](bool ok, const String& raw) {
+void NeatoSerial::fetchRobotPos(const char *cmd, bool smooth, std::function<void(bool, const RobotPosData&)> callback) {
+    enqueue(cmd, [callback, smooth](bool ok, const String& raw) {
         RobotPosData data;
         if (ok)
-            ok = parseRobotPosData(raw, data);
+            ok = parseRobotPosData(raw, data, smooth);
         if (callback)
             callback(ok, data);
     });
@@ -534,7 +579,7 @@ void NeatoSerial::invalidateAll() {
 
 // -- Action command convenience methods --------------------------------------
 
-bool NeatoSerial::clean(const String& action, std::function<void(bool)> callback) {
+bool NeatoSerial::clean(const String& action, int widthCm, int heightCm, std::function<void(bool)> callback) {
     // All cleaning control uses SetEvent — the authenticated event API that D3-D7
     // robots use for their cloud/app protocol. This correctly transitions the UI
     // state machine and preserves map/localization during pause/resume.
@@ -551,6 +596,7 @@ bool NeatoSerial::clean(const String& action, std::function<void(bool)> callback
 
     if (action == "dock") {
         invalidateState();
+        spotStartMismatch = false; // Home/Dock is the safety-net's own recovery hint -- clear the banner
         return enqueue(buildSetEvent(EVT_SEND_TO_BASE), wrapAction(callback), PRIORITY_HIGH);
     }
 
@@ -561,6 +607,7 @@ bool NeatoSerial::clean(const String& action, std::function<void(bool)> callback
 
     if (action == "stop") {
         invalidateState();
+        spotStartMismatch = false; // Stop also ends the mistakenly-started house clean
         return enqueue(buildSetEvent(EVT_STOP), wrapAction(callback), PRIORITY_HIGH);
     }
 
@@ -574,10 +621,31 @@ bool NeatoSerial::clean(const String& action, std::function<void(bool)> callback
 
     // New clean from idle
     invalidateState();
+    spotStartMismatch = false; // Fresh start — clear any stale safety-net notice
+    cleanGeneration++; // New clean session -- invalidates any timer/token armed for a previous one
     if (cleanStartCallback)
         cleanStartCallback();
 
     if (action == "spot") {
+        int w = clampSpotDimension(widthCm);
+        int h = clampSpotDimension(heightCm);
+        spotVerifyPending = true;
+        spotVerifyArmedAt = millis();
+        spotVerifyDelayMs = SPOT_VERIFY_DELAY_MS;
+        spotVerifyAttempts = 0;
+        // Width/height are all-or-nothing: a half-specified request (one clamped to -1,
+        // the other not) silently falls back to the default-size path rather than sending
+        // a nonsense "Height -1" to the robot.
+        if (w < 0 || h < 0) {
+            // Default size — unchanged path, SetEvent only.
+            return enqueue(buildSetEvent(EVT_START_SPOT), wrapAction(callback), PRIORITY_HIGH);
+        }
+        // Mode + size in ONE command — a bare size-only Clean (no mode flag) starts a HOUSE
+        // clean immediately and swallows the SetEvent that follows (hardware-proven).
+        String sizeCmd = String(CMD_CLEAN_SPOT) + " Width " + String(w) + " Height " + String(h);
+        enqueue(sizeCmd, nullptr, PRIORITY_HIGH);
+        // SetEvent kept as the trigger: it's the only start path proven on hardware, and firing
+        // it redundantly at an already-started clean is a proven-safe no-op (see report).
         return enqueue(buildSetEvent(EVT_START_SPOT), wrapAction(callback), PRIORITY_HIGH);
     }
 
@@ -591,6 +659,33 @@ bool NeatoSerial::clean(const String& action, std::function<void(bool)> callback
         }
     }
     return enqueue(buildSetEvent(EVT_START_HOUSE), wrapAction(callback), PRIORITY_HIGH);
+}
+
+void NeatoSerial::checkSpotVerification() {
+    // Force a fresh read — don't trust a cached pre-start snapshot.
+    stateCache.invalidate();
+    getState([this](bool ok, const RobotState& state) {
+        if (ok) {
+            if (isSpotStartMismatch(state.uiState.c_str())) {
+                spotStartMismatch = true;
+                errCache.invalidate(); // Next /api/error poll must pick up the notice
+                LOG("NEATO", "spot clean mismatch: robot reports %s instead of a spot clean", state.uiState.c_str());
+            }
+            return;
+        }
+        // GetState itself failed (serial timeout/desync) — bounded retry rather than silently
+        // losing the only safety net for this clean start.
+        if (spotVerifyAttempts < SPOT_VERIFY_MAX_RETRIES) {
+            spotVerifyAttempts++;
+            spotVerifyPending = true;
+            spotVerifyArmedAt = millis();
+            spotVerifyDelayMs = SPOT_VERIFY_RETRY_DELAY_MS;
+            LOG("NEATO", "spot verify: GetState failed, retry %d/%d", spotVerifyAttempts, SPOT_VERIFY_MAX_RETRIES);
+        } else {
+            LOG("NEATO", "spot verify: GetState failed %d times, giving up — safety net did not run for this clean",
+                SPOT_VERIFY_MAX_RETRIES);
+        }
+    });
 }
 
 bool NeatoSerial::testMode(bool enable, std::function<void(bool)> callback) {
@@ -735,6 +830,7 @@ bool NeatoSerial::powerControl(const String& action, std::function<void(bool)> c
 
 bool NeatoSerial::clearErrors(std::function<void(bool)> callback) {
     invalidateState();
+    spotStartMismatch = false; // Explicit user dismissal of the safety-net notice too
     return enqueue(CMD_SET_UI_ERROR_CLEAR_ALL, wrapAction(callback));
 }
 

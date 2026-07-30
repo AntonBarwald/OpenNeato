@@ -4,6 +4,7 @@ import alertSvg from "../assets/icons/alert.svg?raw";
 import backSvg from "../assets/icons/back.svg?raw";
 import bellSvg from "../assets/icons/bell.svg?raw";
 import boltSvg from "../assets/icons/bolt.svg?raw";
+import brushSvg from "../assets/icons/brush.svg?raw";
 import calendarSvg from "../assets/icons/calendar.svg?raw";
 import chipSvg from "../assets/icons/chip.svg?raw";
 import clockSvg from "../assets/icons/clock.svg?raw";
@@ -1071,6 +1072,15 @@ export function SettingsView({ theme, onThemeChange, language, onLanguageChange,
                             <div class="settings-nav-row-left">
                                 <Icon svg={boltSvg} />
                                 <T>Battery Diagnostics</T>
+                            </div>
+                            <span class="settings-nav-chevron">&rsaquo;</span>
+                        </button>
+                    </div>
+                    <div class="settings-section">
+                        <button type="button" class="settings-nav-row" onClick={() => guardedNavigate("/maintenance")}>
+                            <div class="settings-nav-row-left">
+                                <Icon svg={brushSvg} />
+                                <T>Maintenance</T>
                             </div>
                             <span class="settings-nav-chevron">&rsaquo;</span>
                         </button>

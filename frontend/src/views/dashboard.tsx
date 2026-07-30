@@ -17,6 +17,7 @@ import sparkleSvg from "../assets/icons/sparkle.svg?raw";
 import spotSvg from "../assets/icons/spot.svg?raw";
 import stopSvg from "../assets/icons/stop.svg?raw";
 import tagSvg from "../assets/icons/tag.svg?raw";
+import vacuumSvg from "../assets/icons/vacuum.svg?raw";
 import wifiSvg from "../assets/icons/wifi.svg?raw";
 import wifiOffSvg from "../assets/icons/wifi-off.svg?raw";
 import robotSvg from "../assets/robot.svg?raw";
@@ -24,12 +25,22 @@ import { BatteryIcon } from "../components/battery-icon";
 import { ErrorBanner, ErrorBannerStack, useErrorStack } from "../components/error-banner";
 import { Icon } from "../components/icon";
 import { useNavigate } from "../components/router";
+import { SpotSizeSheet } from "../components/spot-size-sheet";
+import { WholeHouseTimerSheet } from "../components/whole-house-timer-sheet";
 import type { PollResult } from "../hooks/use-polling";
 import { usePolling } from "../hooks/use-polling";
 import { T, useI18n } from "../i18n";
-import type { ChargerData, ErrorData, FirmwareVersion, SettingsData, StateData, SystemData } from "../types";
+import type {
+    ChargerData,
+    CleanTimerStatus,
+    ErrorData,
+    FirmwareVersion,
+    SettingsData,
+    StateData,
+    SystemData,
+} from "../types";
 import type { UpdateInfo } from "../update";
-import { normalizeError } from "../utils";
+import { deriveRobotError, findRecordingSession, normalizeError } from "../utils";
 
 // -- Helpers --
 
@@ -160,17 +171,25 @@ function nextScheduleLabel(settings: SettingsData, localTime: string, t: (text: 
 interface DashboardViewProps {
     firmware: PollResult<FirmwareVersion>;
     state: PollResult<StateData>;
+    error: PollResult<ErrorData>;
     isManual: boolean;
     updateInfo: UpdateInfo | null;
     robotReady: boolean;
     identifying: boolean;
 }
 
-export function DashboardView({ firmware, state, isManual, updateInfo, robotReady, identifying }: DashboardViewProps) {
+export function DashboardView({
+    firmware,
+    state,
+    error,
+    isManual,
+    updateInfo,
+    robotReady,
+    identifying,
+}: DashboardViewProps) {
     const { t, formatSystemTime } = useI18n();
     const navigate = useNavigate();
     const charger = usePolling<ChargerData>(api.getCharger, 5000);
-    const error = usePolling<ErrorData>(api.getError, 2000);
     const settings = usePolling<SettingsData>(api.getSettings, 30000);
     const system = usePolling<SystemData>(api.getSystem, 10000);
 
@@ -184,10 +203,14 @@ export function DashboardView({ firmware, state, isManual, updateInfo, robotRead
 
     // Pending state — disabled until backend confirms state change or timeout
     const [pending, setPending] = useState(false);
+    const [modeChooser, setModeChooser] = useState(false);
     const lastUiState = useRef<string | null>(null);
     const pendingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
     const pendingManual = useRef(false);
     const [actionErrors, actionErrorStack] = useErrorStack();
+    const [openingLiveMap, setOpeningLiveMap] = useState(false);
+    const [spotSizeSheet, setSpotSizeSheet] = useState(false);
+    const [wholeHouseTimerSheet, setWholeHouseTimerSheet] = useState(false);
 
     if (state.data && state.data.uiState !== lastUiState.current) {
         lastUiState.current = state.data.uiState;
@@ -207,6 +230,19 @@ export function DashboardView({ firmware, state, isManual, updateInfo, robotRead
             navigate("/manual");
         }
     }, [isManual, navigate]);
+
+    // One-shot fetch (not a recurring poll) to find the live recording
+    // session's filename, only needed at the moment the user taps this.
+    const handleViewLiveMap = useCallback(() => {
+        setOpeningLiveMap(true);
+        api.getHistoryList()
+            .then((files) => {
+                const recording = findRecordingSession(files);
+                navigate(recording ? `/history/${recording.name}` : "/history");
+            })
+            .catch(() => navigate("/history"))
+            .finally(() => setOpeningLiveMap(false));
+    }, [navigate]);
 
     const handleAction = useCallback(
         (action: () => Promise<unknown>) => {
@@ -236,14 +272,27 @@ export function DashboardView({ firmware, state, isManual, updateInfo, robotRead
     const isSuspended = state.data?.uiState?.includes("CLEANINGSUSPENDED") ?? false;
     const isCleaning = isRunning || isPaused || isSuspended;
     const isSpot = state.data?.uiState?.includes("SPOT") ?? false;
-    const robotError = error.data?.hasError
-        ? {
-              kind: (error.data.kind === "warning" ? "warning" : "error") as "error" | "warning",
-              title: error.data.kind === "warning" ? "Robot Notice" : "Robot Attention Needed",
-              message: error.data.displayMessage || `Robot reported error ${error.data.errorCode}.`,
-          }
-        : null;
+    const robotError = deriveRobotError(error);
     const hasRobotError = robotError?.kind === "error";
+
+    // Whole-house early-return timer status, for the "docks in N min" hint on the live-map banner.
+    const cleanTimer = usePolling<CleanTimerStatus>(api.getCleanTimerStatus, isCleaning ? 5000 : 0);
+
+    // Best-effort: a stale armed timer must not outlive the run it was set for
+    // (see web_server.cpp's /api/clean-timer comment) — fire on any action that
+    // starts a different run or ends the current one; failure isn't fatal.
+    const cancelTimerBestEffort = useCallback(() => {
+        api.cancelCleanTimer().catch(() => {});
+    }, []);
+
+    // Close the mode chooser if the robot's state no longer supports it
+    // (e.g. it starts erroring or the connection drops) while it's open.
+    useEffect(() => {
+        if (modeChooser && (!robotReady || offline || isDocking || isManual || hasRobotError)) {
+            setModeChooser(false);
+        }
+    }, [modeChooser, robotReady, offline, isDocking, isManual, hasRobotError]);
+
     const charging = charger.data?.chargingActive ?? false;
     const docked = charger.data?.extPwrPresent ?? false;
     const pct = charger.data?.fuelPercent ?? 0;
@@ -268,12 +317,12 @@ export function DashboardView({ firmware, state, isManual, updateInfo, robotRead
                 <div class="header-btns">
                     <button
                         type="button"
-                        class="header-right-btn"
-                        aria-label={t("Cleaning History")}
+                        class="header-right-btn header-history-btn"
                         onClick={() => navigate("/history")}
                         disabled={!robotReady}
                     >
                         <Icon svg={historySvg} />
+                        <T>History</T>
                     </button>
                     <button
                         type="button"
@@ -340,12 +389,28 @@ export function DashboardView({ firmware, state, isManual, updateInfo, robotRead
 
             {/* Robot error/warning — fixed, clears automatically when robot resolves it */}
             {robotError && (
-                <ErrorBanner title={t(robotError.title)} message={robotError.message} variant={robotError.kind} />
+                <ErrorBanner
+                    title={t(robotError.title)}
+                    message={robotError.message}
+                    hint={robotError.hint}
+                    variant={robotError.kind}
+                />
             )}
             {!error.data && error.error && !connErr && <ErrorBanner title={t("Warning")} message={error.error} />}
 
             {/* Action errors — dismissible, stackable */}
             <ErrorBannerStack errors={actionErrors} />
+
+            {isCleaning && (
+                <button type="button" class="schedule-banner" onClick={handleViewLiveMap} disabled={openingLiveMap}>
+                    <Icon svg={vacuumSvg} />
+                    <span>
+                        {t(openingLiveMap ? "Opening..." : "Cleaning in progress - view live map")}
+                        {cleanTimer.data?.armed &&
+                            ` · ${t("docks in {min} min", { min: Math.max(1, Math.ceil(cleanTimer.data.remainingSec / 60)) })}`}
+                    </span>
+                </button>
+            )}
 
             {settings.data?.scheduleEnabled && (
                 <button type="button" class="schedule-banner" onClick={() => navigate("/schedule")}>
@@ -435,7 +500,7 @@ export function DashboardView({ firmware, state, isManual, updateInfo, robotRead
                 </div>
             )}
 
-            {/* Bottom action bar — always 3 buttons */}
+            {/* Bottom action bar — 2 or 3 buttons depending on state */}
             <div class="action-bar">
                 <div class="action-bar-row">
                     {isCleaning ? (
@@ -453,7 +518,12 @@ export function DashboardView({ firmware, state, isManual, updateInfo, robotRead
                             <button
                                 type="button"
                                 class={`action-btn${pending ? " pending" : ""}`}
-                                onClick={() => handleAction(api.cleanDock)}
+                                onClick={() =>
+                                    handleAction(() => {
+                                        cancelTimerBestEffort();
+                                        return api.cleanDock();
+                                    })
+                                }
                                 disabled={!robotReady || offline || pending}
                             >
                                 <Icon svg={dockSvg} />
@@ -462,7 +532,34 @@ export function DashboardView({ firmware, state, isManual, updateInfo, robotRead
                             <button
                                 type="button"
                                 class={`action-btn${pending ? " pending" : ""}`}
-                                onClick={() => handleAction(api.cleanStop)}
+                                onClick={() =>
+                                    handleAction(() => {
+                                        cancelTimerBestEffort();
+                                        return api.cleanStop();
+                                    })
+                                }
+                                disabled={!robotReady || offline || pending}
+                            >
+                                <Icon svg={stopSvg} />
+                                <T>Stop</T>
+                            </button>
+                        </>
+                    ) : isManual ? (
+                        <>
+                            {/* Manual session active: reopen the joystick view, or exit manual mode */}
+                            <button
+                                type="button"
+                                class="action-btn primary"
+                                onClick={() => navigate("/manual")}
+                                disabled={!robotReady || !!offline}
+                            >
+                                <Icon svg={manualSvg} />
+                                <T>Manual</T>
+                            </button>
+                            <button
+                                type="button"
+                                class={`action-btn${pending ? " pending" : ""}`}
+                                onClick={() => handleAction(() => api.manual(false))}
                                 disabled={!robotReady || offline || pending}
                             >
                                 <Icon svg={stopSvg} />
@@ -471,52 +568,144 @@ export function DashboardView({ firmware, state, isManual, updateInfo, robotRead
                         </>
                     ) : (
                         <>
-                            {/* Idle / Docking / Manual: House, Spot, Manual/Stop */}
+                            {/* Idle: Start (chooser), Home. While docking, Home flips to Stop. */}
                             <button
                                 type="button"
                                 class={`action-btn primary${pending ? " pending" : ""}`}
-                                onClick={() => handleAction(api.cleanHouse)}
-                                disabled={!robotReady || offline || isDocking || isManual || pending || hasRobotError}
+                                onClick={() => setModeChooser(true)}
+                                disabled={!robotReady || offline || isDocking || pending || hasRobotError}
                             >
-                                <Icon svg={houseSvg} />
-                                <T>House</T>
-                            </button>
-                            <button
-                                type="button"
-                                class={`action-btn${pending ? " pending" : ""}`}
-                                onClick={() => handleAction(api.cleanSpot)}
-                                disabled={!robotReady || offline || isDocking || isManual || pending || hasRobotError}
-                            >
-                                <Icon svg={spotSvg} />
-                                <T>Spot</T>
+                                <Icon svg={playSvg} />
+                                <T>Start</T>
                             </button>
                             <button
                                 type="button"
                                 class={`action-btn${pending ? " pending" : ""}`}
                                 onClick={() =>
-                                    isDocking
-                                        ? handleAction(api.cleanStop)
-                                        : isManual
-                                          ? navigate("/manual")
-                                          : handleAction(() => {
-                                                pendingManual.current = true;
-                                                return api.manual(true);
-                                            })
+                                    handleAction(() => {
+                                        cancelTimerBestEffort();
+                                        return isDocking ? api.cleanStop() : api.cleanDock();
+                                    })
                                 }
                                 disabled={
                                     !robotReady ||
                                     offline ||
-                                    (pending && !isManual) ||
-                                    (hasRobotError && !isManual && !isDocking)
+                                    pending ||
+                                    (!isDocking && (hasRobotError || docked || charging))
                                 }
                             >
-                                <Icon svg={isDocking ? stopSvg : manualSvg} />
-                                {t(isDocking ? "Stop" : "Manual")}
+                                <Icon svg={isDocking ? stopSvg : houseSvg} />
+                                {t(isDocking ? "Stop" : "Home")}
                             </button>
                         </>
                     )}
                 </div>
             </div>
+
+            {modeChooser && (
+                <div class="confirm-overlay" role="dialog" aria-modal="true" onClick={() => setModeChooser(false)}>
+                    <div class="confirm-dialog mode-chooser-dialog" onClick={(e) => e.stopPropagation()}>
+                        <div class="confirm-message">
+                            <T>Start cleaning</T>
+                        </div>
+                        <div class="mode-chooser-list">
+                            <button
+                                type="button"
+                                class="mode-chooser-row primary"
+                                onClick={() => {
+                                    setModeChooser(false);
+                                    setWholeHouseTimerSheet(true);
+                                }}
+                            >
+                                <span class="mode-chooser-row-icon">
+                                    <Icon svg={vacuumSvg} />
+                                </span>
+                                <span class="mode-chooser-row-text">
+                                    <span class="mode-chooser-row-title">
+                                        <T>Whole house</T>
+                                    </span>
+                                    <span class="mode-chooser-row-desc">
+                                        <T>Clean every room, then return to dock</T>
+                                    </span>
+                                </span>
+                            </button>
+                            <button
+                                type="button"
+                                class="mode-chooser-row"
+                                onClick={() => {
+                                    setModeChooser(false);
+                                    setSpotSizeSheet(true);
+                                }}
+                            >
+                                <span class="mode-chooser-row-icon">
+                                    <Icon svg={spotSvg} />
+                                </span>
+                                <span class="mode-chooser-row-text">
+                                    <span class="mode-chooser-row-title">
+                                        <T>Spot</T>
+                                    </span>
+                                    <span class="mode-chooser-row-desc">
+                                        <T>Clean a small area around the robot</T>
+                                    </span>
+                                </span>
+                            </button>
+                            <button
+                                type="button"
+                                class="mode-chooser-row"
+                                onClick={() => {
+                                    setModeChooser(false);
+                                    handleAction(() => {
+                                        cancelTimerBestEffort();
+                                        pendingManual.current = true;
+                                        return api.manual(true);
+                                    });
+                                }}
+                            >
+                                <span class="mode-chooser-row-icon">
+                                    <Icon svg={manualSvg} />
+                                </span>
+                                <span class="mode-chooser-row-text">
+                                    <span class="mode-chooser-row-title">
+                                        <T>Manual</T>
+                                    </span>
+                                    <span class="mode-chooser-row-desc">
+                                        <T>Drive the robot yourself</T>
+                                    </span>
+                                </span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {spotSizeSheet && (
+                <SpotSizeSheet
+                    onCancel={() => setSpotSizeSheet(false)}
+                    onStart={(widthCm, heightCm) => {
+                        setSpotSizeSheet(false);
+                        handleAction(() => {
+                            cancelTimerBestEffort();
+                            return api.cleanSpot(widthCm, heightCm);
+                        });
+                    }}
+                />
+            )}
+
+            {wholeHouseTimerSheet && (
+                <WholeHouseTimerSheet
+                    onCancel={() => setWholeHouseTimerSheet(false)}
+                    onStart={(stopAfterMin) => {
+                        setWholeHouseTimerSheet(false);
+                        handleAction(() => {
+                            if (stopAfterMin === null) {
+                                cancelTimerBestEffort();
+                                return api.cleanHouse();
+                            }
+                            return api.cleanHouse().then(() => api.armCleanTimer(stopAfterMin));
+                        });
+                    }}
+                />
+            )}
         </>
     );
 }

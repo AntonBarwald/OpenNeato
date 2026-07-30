@@ -7,10 +7,10 @@ export type {
     ChargerData,
     ErrorData,
     FirmwareVersion,
-    HistoryFileInfo,
     LidarPoint,
     LidarScan,
     LogFileInfo,
+    MaintenanceData,
     ManualStatus,
     MapSession,
     MapSummary,
@@ -24,6 +24,11 @@ export type {
     WiFiScanResult,
     WiFiStatus,
 } from "./types.generated";
+
+// Augmented with a frontend-only `pinned` flag.
+export type HistoryFileInfo = import("./types.generated").HistoryFileInfo & {
+    pinned?: boolean;
+};
 
 // -- Frontend-only types (not part of the HTTP API) --------------------------
 // These describe shapes used internally by the map view and aren't exchanged
@@ -75,3 +80,32 @@ export interface MapData {
     bounds: MapBounds | null;
     cellSize: number;
 }
+
+// -- Map zone/no-go annotations (frontend-only for now) ----------------------
+// Zones and no-go lines drawn on a session's map, in robot-world meters (same frame as
+// MapPathPoint); persisted per-session at /api/history/<name>/zones.
+
+export interface ZonePoint {
+    x: number;
+    y: number;
+}
+
+// An open polyline the robot must not be routed across.
+export interface NoGoLine {
+    points: ZonePoint[];
+}
+
+// A closed polygon selecting an area to clean (rectangles are a subset).
+export interface MapZone {
+    points: ZonePoint[];
+    label?: string;
+}
+
+export interface ZonesBlob {
+    zones: MapZone[];
+    noGoLines: NoGoLine[];
+}
+
+// Re-exported separately (append-only) so api.ts's existing "./types" import
+// block can pick it up without reordering the generated-types list above.
+export type { CleanTimerStatus } from "./types.generated";

@@ -143,6 +143,8 @@ void CleaningHistory::startCollection(const String& uiState) {
     resetSession();
 
     cleanMode = cleanModeFromState(uiState);
+    if (guidedActive && cleanMode == "manual")
+        cleanMode = "guided";
     sessionStartTime = systemManager.now();
 
     // Create session file: /history/<epoch>.jsonl
@@ -393,21 +395,6 @@ void CleaningHistory::flushWriteBuffer() {
 
 // -- Snapshot collection (active mode) ---------------------------------------
 
-static bool parsePose(const String& raw, float& x, float& y, float& theta, float& time) {
-    int xPos = raw.indexOf("X=");
-    int yPos = raw.indexOf("Y=");
-    int tPos = raw.indexOf("Theta=");
-    int tmPos = raw.indexOf("Time=");
-    if (xPos < 0 || yPos < 0 || tPos < 0 || tmPos < 0)
-        return false;
-
-    x = raw.substring(xPos + 2).toFloat();
-    y = raw.substring(yPos + 2).toFloat();
-    theta = raw.substring(tPos + 6).toFloat();
-    time = raw.substring(tmPos + 5).toFloat();
-    return true;
-}
-
 // Parse a single JSONL line and update session accumulators (header, recharge, pose).
 // Returns true if the line was a session header.
 bool CleaningHistory::replayLine(const String& line) {
@@ -535,6 +522,8 @@ bool CleaningHistory::recoverCollection(const String& uiState) {
     // Now replay the merged file to rebuild accumulators
     resetSession();
     cleanMode = cleanModeFromState(uiState);
+    if (guidedActive && cleanMode == "manual")
+        cleanMode = "guided";
     activeFilePath = targetPath;
 
     File recoveryFile = SPIFFS.open(targetPath, FILE_READ);
@@ -757,13 +746,12 @@ void CleaningHistory::collectSnapshot() {
                 if (!posOk)
                     return;
 
-                float x, y, theta, time;
-                if (!parsePose(pos.raw, x, y, theta, time)) {
+                if (!pos.hasPose) {
                     LOG("HIST", "Failed to parse pose");
                     return;
                 }
 
-                writeSnapshot(x, y, theta, time);
+                writeSnapshot(pos.x, pos.y, pos.theta, pos.time);
             });
         });
     });
@@ -846,15 +834,24 @@ void CleaningHistory::enforceLimits() {
         histDirBytes += entry.size();
         if (name.endsWith(".jsonl") || name.endsWith(".jsonl.hs")) {
             fileCount++;
-            if (oldest.isEmpty() || name < oldest) {
+            // Pinned sessions still count toward the budget (they occupy real
+            // flash space) but are never selected as the eviction candidate.
+            bool pinned = pinnedCheck && pinnedCheck(name);
+            if (!pinned && (oldest.isEmpty() || name < oldest)) {
                 oldest = name;
             }
         }
         entry = root.openNextFile();
     }
 
-    if (oldest.isEmpty())
+    if (oldest.isEmpty()) {
+        // Every session is pinned: nothing is evictable. Warn if we're at/over
+        // the file limit so this is diagnosable — otherwise storage silently
+        // fills and new recordings fail with only a generic open error.
+        if (fileCount >= HISTORY_MAX_FILES)
+            LOG("HIST", "Over file limit but all %d sessions pinned — cannot evict", fileCount);
         return;
+    }
 
     // History budget: total filesystem cap minus non-history data, floored at minimum reserve
     size_t total = SPIFFS.totalBytes();

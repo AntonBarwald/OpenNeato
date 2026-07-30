@@ -3,12 +3,13 @@ import { api } from "./api";
 import { Route, Router } from "./components/router";
 import { usePolling } from "./hooks/use-polling";
 import { I18nProvider, type LanguagePreference, loadLanguagePreference, resolveLocale } from "./i18n";
-import type { FirmwareVersion, ManualStatus, StateData } from "./types";
+import type { ErrorData, FirmwareVersion, ManualStatus, StateData } from "./types";
 import { checkForUpdate, getAvailableUpdate, type UpdateInfo } from "./update";
 import { BatteryView } from "./views/battery";
 import { DashboardView } from "./views/dashboard";
 import { HistoryView } from "./views/history";
 import { LogsView } from "./views/logs";
+import { MaintenanceView } from "./views/maintenance";
 import { ManualView } from "./views/manual";
 import { ScheduleView } from "./views/schedule";
 import { SettingsView } from "./views/settings";
@@ -72,6 +73,7 @@ export function App() {
 
     const state = usePolling<StateData>(api.getState, 2000);
     const firmware = usePolling<FirmwareVersion>(api.getFirmwareVersion, 60000);
+    const error = usePolling<ErrorData>(api.getError, 2000);
 
     // --- Update check (browser-side, GitHub releases API) ---
     const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
@@ -155,6 +157,7 @@ export function App() {
                     <DashboardView
                         firmware={firmware}
                         state={state}
+                        error={error}
                         isManual={isManual}
                         updateInfo={updateInfo}
                         robotReady={robotReady}
@@ -191,11 +194,14 @@ export function App() {
                 <Route path="/battery">
                     <BatteryView firmwareSupported={firmware.data?.supported !== false} />
                 </Route>
+                <Route path="/maintenance">
+                    <MaintenanceView firmwareSupported={firmware.data?.supported !== false} />
+                </Route>
                 <Route path="/logs" prefix>
                     <LogsView />
                 </Route>
                 <Route path="/history" prefix>
-                    <HistoryView />
+                    <HistoryView error={error} />
                 </Route>
             </Router>
         </I18nProvider>

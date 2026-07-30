@@ -14,7 +14,12 @@
 #include "manual_clean_manager.h"
 #include "notification_manager.h"
 #include "cleaning_history.h"
+#include "zones_manager.h"
+#include "navigation_poc.h"
+#include "navigation_manager.h"
+#include "maintenance_tracker.h"
 #include "loop_task.h"
+#include "whole_house_timer.h"
 
 // Global objects
 Preferences prefs;
@@ -25,12 +30,19 @@ SettingsManager settingsManager(prefs);
 DataLogger dataLogger(neatoSerial, systemManager);
 WiFiManager wifiManager(prefs, dataLogger);
 FirmwareManager firmwareManager(dataLogger);
-Scheduler scheduler(settingsManager, systemManager, neatoSerial, dataLogger);
 ManualCleanManager manualClean(neatoSerial);
 NotificationManager notifMgr(neatoSerial, settingsManager, dataLogger);
 CleaningHistory cleaningHistory(neatoSerial, dataLogger, systemManager);
+ZonesManager zonesManager;
+NavigationPoc navigationPoc(neatoSerial, manualClean);
+NavigationManager navigationManager(neatoSerial, cleaningHistory, zonesManager, manualClean, dataLogger);
+// Constructed after navigationManager/notifMgr — Scheduler needs both for scheduled guided cleans.
+Scheduler scheduler(settingsManager, systemManager, neatoSerial, dataLogger, navigationManager, notifMgr);
+MaintenanceTracker maintenanceTracker(neatoSerial, prefs);
+WholeHouseTimer wholeHouseTimer(neatoSerial);
 WebServer webServer(server, neatoSerial, dataLogger, systemManager, firmwareManager, settingsManager, manualClean,
-                    notifMgr, cleaningHistory, wifiManager);
+                    notifMgr, cleaningHistory, wifiManager, zonesManager, navigationPoc, navigationManager,
+                    maintenanceTracker, wholeHouseTimer);
 
 // Tracks whether web server has been started (may be deferred if WiFi was slow at boot)
 bool webServerStarted = false;
@@ -45,6 +57,11 @@ void setup() {
 
     // Open shared NVS namespace (stays open for the lifetime of the device)
     prefs.begin(NVS_NAMESPACE, false);
+
+    // Load persisted maintenance counters — must happen after prefs.begin()
+    // (the MaintenanceTracker global is constructed during static init,
+    // before prefs.begin() has run, so its NVS reads are deferred here).
+    maintenanceTracker.begin();
 
     // Setup reset button
     pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
@@ -77,6 +94,10 @@ void setup() {
     // Wire clean start hook so CleaningHistory switches to active polling
     // immediately when a clean command is sent via API.
     neatoSerial.onCleanStart([&] { cleaningHistory.notifyCleanStart(); });
+
+    // Wire pinned-session check so CleaningHistory::enforceLimits skips
+    // user-pinned sessions when evicting oldest sessions for storage budget.
+    cleaningHistory.setPinnedCheck([&](const String& name) { return zonesManager.isPinned(name); });
 
     // Wire navigation mode getter so clean() sends SetNavigationMode before house cleans
     neatoSerial.setNavModeGetter([&] { return settingsManager.get().navMode; });

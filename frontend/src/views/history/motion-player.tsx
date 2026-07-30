@@ -10,13 +10,22 @@ import { Icon } from "../../components/icon";
 import { useKeyShortcut } from "../../hooks/use-key-shortcut";
 import { useI18n } from "../../i18n";
 import type { MapData, MapTransform } from "../../types";
-import { renderMap, sessionDuration } from "./helpers";
+import type { Point } from "./geometry";
+import { type MapEditorOverlay, renderMap, sessionDuration } from "./helpers";
 
 interface MotionPlayerProps {
     canvas: HTMLCanvasElement | null;
     map: MapData;
     transform: MapTransform;
     rotation: number;
+    // No-go lines to overlay on the replayed map (robot-world meters).
+    nogoLines?: Point[][];
+    // In-progress no-go line draft (editor draw mode), overlaid the same way
+    // the static renderer shows it.
+    draftLine?: Point[] | null;
+    // Guided Clean editor overlay: zones, draft zone shape, selection
+    // highlight, and the enforcement preview toggle — see helpers.ts.
+    overlay?: MapEditorOverlay;
     // Seconds of session time played per real second. 1x replays in real time,
     // higher values speed the playback up proportionally.
     speed?: number;
@@ -26,7 +35,17 @@ interface MotionPlayerProps {
     canvasSuspended?: boolean;
 }
 
-export function MotionPlayer({ canvas, map, transform, rotation, speed = 8, canvasSuspended }: MotionPlayerProps) {
+export function MotionPlayer({
+    canvas,
+    map,
+    transform,
+    rotation,
+    nogoLines = [],
+    draftLine = null,
+    overlay,
+    speed = 8,
+    canvasSuspended,
+}: MotionPlayerProps) {
     const { t, formatClock } = useI18n();
     const duration = sessionDuration(map);
     const [playing, setPlaying] = useState(false);
@@ -53,19 +72,19 @@ export function MotionPlayer({ canvas, map, transform, rotation, speed = 8, canv
     useEffect(() => {
         if (canvasSuspended) return;
         if (!canvas || !map) return;
-        renderMap(canvas, map, false, transform, currentTime, rotation);
-    }, [canvas, map, transform, currentTime, rotation, canvasSuspended]);
+        renderMap(canvas, map, false, transform, currentTime, rotation, nogoLines, draftLine, overlay);
+    }, [canvas, map, transform, currentTime, rotation, canvasSuspended, nogoLines, draftLine, overlay]);
 
     // Re-render on resize — canvas backing store gets invalidated.
     useEffect(() => {
         if (canvasSuspended) return;
         if (!canvas) return;
         const onResize = () => {
-            renderMap(canvas, map, false, transform, timeRef.current, rotation);
+            renderMap(canvas, map, false, transform, timeRef.current, rotation, nogoLines, draftLine, overlay);
         };
         window.addEventListener("resize", onResize);
         return () => window.removeEventListener("resize", onResize);
-    }, [canvas, map, transform, rotation, canvasSuspended]);
+    }, [canvas, map, transform, rotation, canvasSuspended, nogoLines, draftLine, overlay]);
 
     // Reset to the completed map whenever the session switches. The scrubber
     // anchors at `duration` so the user sees the full session at rest.
